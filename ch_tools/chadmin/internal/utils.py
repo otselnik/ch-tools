@@ -3,17 +3,22 @@ Utility functions.
 """
 
 import os
-import random
 import re
 import shutil
 import threading
-import time
 from enum import Enum
 from itertools import islice
 from typing import Any, Iterable, Iterator, Optional
 
 import requests
 from click import Context
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from ch_tools.common import logging
 from ch_tools.common.clickhouse.client.clickhouse_client import clickhouse_client
@@ -150,13 +155,14 @@ def _is_retryable_error(error: BaseException) -> bool:
     Determine if an error is transient and can be retried.
 
     Retryable errors:
-    - requests.exceptions.Timeout, ReadTimeout, ConnectTimeout (transient network issues)
-    - HTTP 408, 429, 500, 502, 503, 504 from ClickHouse
+    - requests.exceptions.Timeout, ReadTimeout (transient network issues)
+    - HTTP 408, 500, 503 from ClickHouse (TIMEOUT_EXCEEDED, internal errors, SOCKET_TIMEOUT)
     - requests.exceptions.ChunkedEncodingError (transient network)
 
     Non-retryable errors:
     - requests.exceptions.ConnectionError (node unavailable/not started)
-    - SQL errors (4xx except 408/429)
+    - HTTP 4xx (client errors: syntax, permissions, unknown tables, etc.)
+    - HTTP 429, 502, 504 (not returned by ClickHouse directly - proxy errors)
     - Schema errors
     """
     # Direct timeout errors are retryable
@@ -171,23 +177,9 @@ def _is_retryable_error(error: BaseException) -> bool:
 
     # ClickHouse HTTP errors - check status code
     if isinstance(error, ClickhouseError):
-        retryable_status_codes = {408, 429, 500, 502, 503, 504}
+        retryable_status_codes = {408, 500, 503}
         status_code = error.response.status_code if error.response else None
-        if status_code in retryable_status_codes:
-            return True
-
-        # Check ClickHouse error code for connection-related errors
-        # Code 279: ALL_CONNECTION_TRIES_FAILED - retryable (transient network issue)
-        # Code 210: NETWORK_ERROR - retryable (transient network issue)
-        error_text = str(error)
-        retryable_error_codes = {
-            "Code: 279",
-            "Code: 210",
-            "ALL_CONNECTION_TRIES_FAILED",
-            "NETWORK_ERROR",
-        }
-        if any(code in error_text for code in retryable_error_codes):
-            return True
+        return status_code in retryable_status_codes
 
     # ConnectionError means node is unavailable - not retryable
     if isinstance(error, requests.exceptions.ConnectionError):
@@ -214,55 +206,36 @@ def _execute_query_with_retry(
     """
     Execute query on a specific replica with retry logic for transient errors.
     """
-    last_exception: Optional[Exception] = None
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return execute_query(
-                ctx,
-                query,
-                timeout=timeout,
-                echo=echo,
-                dry_run=dry_run,
-                format_=format_,
-                stream=stream,
-                settings=settings,
-                replica=replica,
-                log_query=log_query,
-                **kwargs,
-            )
-        except Exception as e:
-            last_exception = e
+    def log_before_sleep(rcs: RetryCallState) -> None:
+        if rcs.outcome is None or rcs.next_action is None:
+            return
+        logging.warning(
+            f"Query on replica {replica} failed (attempt {rcs.attempt_number}/{max_attempts}): "
+            f"{rcs.outcome.exception()}. Retrying in {rcs.next_action.sleep:.2f}s..."
+        )
 
-            if not _is_retryable_error(e):
-                # Non-retryable error - fail immediately
-                logging.error(
-                    f"Query on replica {replica} failed with non-retryable error: {e}"
-                )
-                raise
+    retry_decorator = retry(
+        retry=retry_if_exception(_is_retryable_error),
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_random_exponential(max=max_interval),
+        before_sleep=log_before_sleep,
+        reraise=True,
+    )
 
-            if attempt < max_attempts:
-                # Calculate exponential backoff with jitter
-                delay = min(
-                    max_interval * (0.5 ** (max_attempts - attempt)), max_interval
-                )
-                jitter = random.uniform(0, delay * 0.1)
-                actual_delay = delay + jitter
-
-                logging.warning(
-                    f"Query on replica {replica} failed (attempt {attempt}/{max_attempts}): {e}. "
-                    f"Retrying in {actual_delay:.2f}s..."
-                )
-                time.sleep(actual_delay)
-            else:
-                logging.error(
-                    f"Query on replica {replica} failed after {max_attempts} attempts: {e}"
-                )
-
-    # All attempts exhausted
-    if last_exception:
-        raise last_exception
-    raise RuntimeError("Unexpected state: no exception but all attempts exhausted")
+    return retry_decorator(execute_query)(
+        ctx,
+        query,
+        timeout=timeout,
+        echo=echo,
+        dry_run=dry_run,
+        format_=format_,
+        stream=stream,
+        settings=settings,
+        replica=replica,
+        log_query=log_query,
+        **kwargs,
+    )
 
 
 def execute_query_on_shard(
