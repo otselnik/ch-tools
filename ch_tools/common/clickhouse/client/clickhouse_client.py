@@ -27,7 +27,7 @@ PORTS_PRIORITY = [
 ]
 
 
-class ClickhouseClient:
+class ClickhouseClient:  # pylint: disable=too-many-instance-attributes
     """
     ClickHouse client wrapper.
     """
@@ -43,6 +43,8 @@ class ClickhouseClient:
         cert_path: Optional[str] = None,
         timeout: int,
         settings: Optional[Dict[str, Any]] = None,
+        retry_max_attempts: int = 5,
+        retry_max_interval: int = 5,
     ) -> None:
         self.host = host
         self.insecure = insecure
@@ -52,6 +54,8 @@ class ClickhouseClient:
         self.password = password
         self._settings = settings or {}
         self._timeout = timeout
+        self._retry_max_attempts = retry_max_attempts
+        self._retry_max_interval = retry_max_interval
         self._ch_version: Optional[str] = None
 
     def get_clickhouse_version(self) -> str:
@@ -183,9 +187,6 @@ class ClickhouseClient:
         host: Optional[str] = None,
         port: Optional[ClickhousePort] = None,
         log_query: bool = True,
-        retry_on_transient_errors: bool = False,
-        retry_max_attempts: Optional[int] = None,
-        retry_max_interval: Optional[int] = None,
     ) -> Any:
         """
         Execute query.
@@ -193,22 +194,16 @@ class ClickhouseClient:
         ``query`` may be ``None`` to perform a connectivity check (used by
         :meth:`ping`); in that case an HTTP GET to the server root is issued.
 
-        By default, preserves the historical retry behavior and retries only
-        connection errors. Set ``retry_on_transient_errors`` to additionally
-        retry Timeout, ReadTimeout, ChunkedEncodingError, and ClickhouseError
-        with retryable status codes (408, 429, 500, 502, 503, 504).
+        Retries transient errors (ConnectionError, Timeout, ReadTimeout,
+        ChunkedEncodingError, and ClickhouseError with status codes
+        408, 429, 500, 502, 503, 504) using exponential back-off.
         """
-        predicate = (
-            is_transient_error
-            if retry_on_transient_errors
-            else lambda exc: isinstance(exc, requests.exceptions.ConnectionError)
-        )
-        max_attempts = retry_max_attempts if retry_max_attempts is not None else 5
-        max_interval = retry_max_interval if retry_max_interval is not None else 5
         retrying = tenacity.Retrying(
-            retry=tenacity.retry_if_exception(predicate),
-            wait=tenacity.wait_random_exponential(multiplier=0.5, max=max_interval),
-            stop=tenacity.stop_after_attempt(max_attempts),
+            retry=tenacity.retry_if_exception(is_transient_error),
+            wait=tenacity.wait_random_exponential(
+                multiplier=0.5, max=self._retry_max_interval
+            ),
+            stop=tenacity.stop_after_attempt(self._retry_max_attempts),
             before_sleep=_log_retry_attempt,
             reraise=True,
         )
@@ -360,6 +355,7 @@ def clickhouse_client(ctx: Context) -> ClickhouseClient:
     if not ctx.obj.get("chcli"):
         ch_server_config = get_clickhouse_config(ctx)
         tools_config = ctx.obj["config"]["clickhouse"]
+        retries_cfg = tools_config["retries"]
         user, password = clickhouse_credentials(ctx)
         ctx.obj["chcli"] = ClickhouseClient(
             host=tools_config["host"],
@@ -370,6 +366,8 @@ def clickhouse_client(ctx: Context) -> ClickhouseClient:
             insecure=tools_config["insecure"],
             timeout=tools_config["timeout"],
             settings=tools_config["settings"],
+            retry_max_attempts=retries_cfg["max_attempts"],
+            retry_max_interval=retries_cfg["max_interval"],
         )
 
     return ctx.obj["chcli"]

@@ -32,6 +32,10 @@ DEFAULT_CONFIG = {
         "monitoring_password": None,
         "distributed_ddl_path": "/clickhouse/task_queue/ddl",
         "timeout": 60,
+        "retries": {
+            "max_attempts": 5,
+            "max_interval": 5,
+        },
         "attach_table_timeout": 10 * 60,
         "detach_table_timeout": 10 * 60,
         "alter_table_timeout": 10 * 60,
@@ -70,11 +74,6 @@ DEFAULT_CONFIG = {
         },
         # see https://docs.aws.amazon.com/botocore/latest/reference/config.html for details
         "retries": None,
-        # Retry settings for shard-level queries (used in object-storage clean and similar operations)
-        "shard_query_retries": {
-            "max_attempts": 5,
-            "max_interval": 30,
-        },
     },
     "zookeeper": {
         "randomize_hosts": True,

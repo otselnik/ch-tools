@@ -295,9 +295,6 @@ def delete_table(
     echo: bool = False,
     sync_mode: bool = True,
     dry_run: bool = False,
-    retry_on_transient_errors: bool = False,
-    retry_max_attempts: Optional[int] = None,
-    retry_max_interval: Optional[int] = None,
 ) -> None:
     """
     Perform "DROP TABLE" for the specified table.
@@ -328,9 +325,6 @@ def delete_table(
         echo=echo,
         dry_run=dry_run,
         format_=None,
-        retry_on_transient_errors=retry_on_transient_errors,
-        retry_max_attempts=retry_max_attempts,
-        retry_max_interval=retry_max_interval,
     )
 
 

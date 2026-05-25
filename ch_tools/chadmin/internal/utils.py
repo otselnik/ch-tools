@@ -59,9 +59,6 @@ def execute_query(
     settings: Optional[Any] = None,
     replica: Optional[str] = None,
     log_query: bool = True,
-    retry_on_transient_errors: bool = False,
-    retry_max_attempts: Optional[int] = None,
-    retry_max_interval: Optional[int] = None,
     **kwargs: Any,
 ) -> Any:
     """
@@ -83,18 +80,12 @@ def execute_query(
         settings=settings,
         host=replica,
         log_query=log_query,
-        retry_on_transient_errors=retry_on_transient_errors,
-        retry_max_attempts=retry_max_attempts,
-        retry_max_interval=retry_max_interval,
     )
 
 
 def check_replicas_availability(
     ctx: Context,
     timeout: int = 5,
-    retry_on_transient_errors: bool = True,
-    retry_max_attempts: Optional[int] = None,
-    retry_max_interval: Optional[int] = None,
 ) -> bool:
     """
     Check if all replicas in the shard are available by executing a lightweight query.
@@ -111,9 +102,6 @@ def check_replicas_availability(
                 timeout=timeout,
                 replica=replica,
                 log_query=False,
-                retry_on_transient_errors=retry_on_transient_errors,
-                retry_max_attempts=retry_max_attempts,
-                retry_max_interval=retry_max_interval,
             )
         except Exception:
             # Replica is unavailable
@@ -133,9 +121,6 @@ def execute_query_on_shard(
     stream: bool = False,
     settings: Optional[Any] = None,
     log_query: bool = True,
-    retry_on_transient_errors: bool = False,
-    retry_max_attempts: Optional[int] = None,
-    retry_max_interval: Optional[int] = None,
     **kwargs: Any,
 ) -> None:
     """
@@ -155,9 +140,6 @@ def execute_query_on_shard(
             settings=settings,
             replica=replica,
             log_query=log_query,
-            retry_on_transient_errors=retry_on_transient_errors,
-            retry_max_attempts=retry_max_attempts,
-            retry_max_interval=retry_max_interval,
             **kwargs,
         )
 
