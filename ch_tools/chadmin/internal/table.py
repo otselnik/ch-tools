@@ -317,36 +317,21 @@ def delete_table(
         {%- endif %}
         """
 
-    if not shard:
-        execute_query(
-            ctx,
-            query,
-            timeout=timeout,
-            database_name=database_name,
-            table_name=table_name,
-            cluster=cluster,
-            sync_mode=sync_mode,
-            echo=echo,
-            dry_run=dry_run,
-            format_=None,
-        )
-    else:
-        # Use execute_query_on_shard with retry support
-        execute_query_on_shard(
-            ctx,
-            query,
-            timeout=timeout,
-            database_name=database_name,
-            table_name=table_name,
-            cluster=cluster,
-            sync_mode=sync_mode,
-            echo=echo,
-            dry_run=dry_run,
-            format_=None,
-            retry_on_transient_errors=retry_on_transient_errors,
-            retry_max_attempts=retry_max_attempts,
-            retry_max_interval=retry_max_interval,
-        )
+    (execute_query if not shard else execute_query_on_shard)(
+        ctx,
+        query,
+        timeout=timeout,
+        database_name=database_name,
+        table_name=table_name,
+        cluster=cluster,
+        sync_mode=sync_mode,
+        echo=echo,
+        dry_run=dry_run,
+        format_=None,
+        retry_on_transient_errors=retry_on_transient_errors,
+        retry_max_attempts=retry_max_attempts,
+        retry_max_interval=retry_max_interval,
+    )
 
 
 def delete_table_by_full_name(

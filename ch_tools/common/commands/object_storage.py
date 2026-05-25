@@ -1051,6 +1051,21 @@ def _insert_local_blobs_batch(
     )
 
 
+def _shard_query_retry_kwargs(ctx: Context) -> Dict[str, Any]:
+    """
+    Build retry kwargs for shard-wide queries from the object_storage config section.
+
+    Returned dict is suitable for passing to execute_query_on_shard/
+    check_replicas_availability/delete_table_by_full_name as **kwargs.
+    """
+    retries_cfg = ctx.obj["config"]["object_storage"]["shard_query_retries"]
+    return {
+        "retry_on_transient_errors": True,
+        "retry_max_attempts": retries_cfg["max_attempts"],
+        "retry_max_interval": retries_cfg["max_interval"],
+    }
+
+
 def _create_remote_blobs_table(
     ctx: Context,
     table_name: str,
@@ -1059,12 +1074,12 @@ def _create_remote_blobs_table(
     replicated: bool,
     drop_existing_table: bool = False,
 ) -> None:
+    retry_kwargs = _shard_query_retry_kwargs(ctx)
+
     if drop_existing_table:
         # Check all replicas are available before destructive DROP operation
         # This prevents partial deletion when local replica succeeds but remote fails
-        if not check_replicas_availability(
-            ctx, timeout=5, retry_on_transient_errors=True
-        ):
+        if not check_replicas_availability(ctx, timeout=5, **retry_kwargs):
             raise RuntimeError(
                 "Not all replicas are available. Skipping DROP TABLE to prevent partial deletion. "
                 "Please ensure all replicas are up and retry the operation."
@@ -1098,7 +1113,7 @@ def _create_remote_blobs_table(
             SETTINGS storage_policy = '{storage_policy}'
         """,
         format_=None,
-        retry_on_transient_errors=True,
+        **retry_kwargs,
     )
 
 

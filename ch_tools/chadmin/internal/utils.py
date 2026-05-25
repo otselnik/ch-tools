@@ -66,10 +66,6 @@ def execute_query(
 ) -> Any:
     """
     Execute ClickHouse query.
-
-    By default, preserves the historical retry behaviour and retries only
-    connection errors. Set ``retry_on_transient_errors`` to additionally retry
-    transient errors. See :meth:`ClickhouseClient.query` for details.
     """
     if format_ == "default":
         format_ = "PrettyCompact"
@@ -107,15 +103,6 @@ def check_replicas_availability(
     """
     replicas = ClickhouseInfo.get_replicas(ctx)
 
-    max_attempts = (
-        retry_max_attempts
-        or ctx.obj["config"]["object_storage"]["shard_query_retries"]["max_attempts"]
-    )
-    max_interval = (
-        retry_max_interval
-        or ctx.obj["config"]["object_storage"]["shard_query_retries"]["max_interval"]
-    )
-
     for replica in replicas:
         try:
             execute_query(
@@ -125,8 +112,8 @@ def check_replicas_availability(
                 replica=replica,
                 log_query=False,
                 retry_on_transient_errors=retry_on_transient_errors,
-                retry_max_attempts=max_attempts,
-                retry_max_interval=max_interval,
+                retry_max_attempts=retry_max_attempts,
+                retry_max_interval=retry_max_interval,
             )
         except Exception:
             # Replica is unavailable
@@ -156,15 +143,6 @@ def execute_query_on_shard(
     """
     replicas = ClickhouseInfo.get_replicas(ctx)
 
-    max_attempts = (
-        retry_max_attempts
-        or ctx.obj["config"]["object_storage"]["shard_query_retries"]["max_attempts"]
-    )
-    max_interval = (
-        retry_max_interval
-        or ctx.obj["config"]["object_storage"]["shard_query_retries"]["max_interval"]
-    )
-
     for replica in replicas:
         execute_query(
             ctx,
@@ -178,8 +156,8 @@ def execute_query_on_shard(
             replica=replica,
             log_query=log_query,
             retry_on_transient_errors=retry_on_transient_errors,
-            retry_max_attempts=max_attempts,
-            retry_max_interval=max_interval,
+            retry_max_attempts=retry_max_attempts,
+            retry_max_interval=retry_max_interval,
             **kwargs,
         )
 
