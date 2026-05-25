@@ -16,16 +16,15 @@ def is_transient_error(exc: BaseException) -> bool:
     - requests.exceptions.ConnectionError (network issues, DNS, connection reset)
     - requests.exceptions.Timeout, ReadTimeout (transient network issues)
     - requests.exceptions.ChunkedEncodingError (transient network)
-    - ClickhouseError with HTTP status codes:
-      - 408: Request Timeout
-      - 429: Too Many Requests (proxy/load balancer)
-      - 500: Internal Server Error
-      - 502: Bad Gateway (proxy)
+    - ClickhouseError with HTTP status codes from proxy/load balancer:
+      - 429: Too Many Requests
+      - 502: Bad Gateway
       - 503: Service Unavailable
-      - 504: Gateway Timeout (proxy)
+      - 504: Gateway Timeout
 
     Non-retryable errors:
-    - HTTP 4xx (except 408, 429): client errors (syntax, permissions, unknown tables)
+    - HTTP 500: real ClickHouse DB errors (not idempotent to retry)
+    - HTTP 4xx: client errors (syntax, permissions, unknown tables)
     - All other exceptions
     """
     # Network-related errors are retryable
@@ -43,7 +42,7 @@ def is_transient_error(exc: BaseException) -> bool:
     # ClickHouse HTTP errors - check status code. Do not rely on
     # requests.Response truthiness: 4xx/5xx responses are falsy.
     if isinstance(exc, ClickhouseError):
-        retryable_status_codes = {408, 429, 500, 502, 503, 504}
+        retryable_status_codes = {429, 502, 503, 504}
         status_code = exc.response.status_code if exc.response is not None else None
         return status_code in retryable_status_codes
 
