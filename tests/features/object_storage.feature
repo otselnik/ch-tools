@@ -19,9 +19,6 @@ Feature: chadmin object-storage commands
         local_blobs_table_prefix: "local_objects_"
         remote_blobs_table_prefix: "listing_objects_from_"
         orphaned_blobs_table_prefix: "orphaned_objects_"
-      shard_query_retries:
-        max_attempts: 2
-        max_interval: 1
     """
     And a working s3
     And a working zookeeper
