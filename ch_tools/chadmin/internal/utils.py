@@ -10,19 +10,10 @@ from enum import Enum
 from itertools import islice
 from typing import Any, Iterable, Iterator, Optional
 
-import requests
 from click import Context
-from tenacity import (
-    RetryCallState,
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_random_exponential,
-)
 
 from ch_tools.common import logging
 from ch_tools.common.clickhouse.client.clickhouse_client import clickhouse_client
-from ch_tools.common.clickhouse.client.error import ClickhouseError
 from ch_tools.common.clickhouse.config.clickhouse import ClickhousePort
 from ch_tools.monrun_checks.clickhouse_info import ClickhouseInfo
 
@@ -68,10 +59,17 @@ def execute_query(
     settings: Optional[Any] = None,
     replica: Optional[str] = None,
     log_query: bool = True,
+    retry_on_transient_errors: bool = False,
+    retry_max_attempts: Optional[int] = None,
+    retry_max_interval: Optional[int] = None,
     **kwargs: Any,
 ) -> Any:
     """
     Execute ClickHouse query.
+
+    By default, preserves the historical retry behaviour and retries only
+    connection errors. Set ``retry_on_transient_errors`` to additionally retry
+    transient errors. See :meth:`ClickhouseClient.query` for details.
     """
     if format_ == "default":
         format_ = "PrettyCompact"
@@ -83,12 +81,15 @@ def execute_query(
         query_args=kwargs,
         timeout=timeout,
         format_=format_,
-        echo=echo,
-        dry_run=dry_run,
+        echo=bool(echo),
+        dry_run=bool(dry_run),
         stream=stream,
         settings=settings,
         host=replica,
         log_query=log_query,
+        retry_on_transient_errors=retry_on_transient_errors,
+        retry_max_attempts=retry_max_attempts,
+        retry_max_interval=retry_max_interval,
     )
 
 
@@ -103,11 +104,9 @@ def check_replicas_availability(
     Check if all replicas in the shard are available by executing a lightweight query.
 
     Returns True if all replicas are available, False otherwise.
-    Raises an exception if any replica is unavailable with non-retryable error.
     """
     replicas = ClickhouseInfo.get_replicas(ctx)
 
-    # Get retry settings from config if retry is enabled
     max_attempts = (
         retry_max_attempts
         or ctx.obj["config"]["object_storage"]["shard_query_retries"]["max_attempts"]
@@ -119,123 +118,22 @@ def check_replicas_availability(
 
     for replica in replicas:
         try:
-            if retry_on_transient_errors:
-                _execute_query_with_retry(
-                    ctx,
-                    "SELECT 1",
-                    replica,
-                    timeout=timeout,
-                    echo=False,
-                    dry_run=False,
-                    format_=None,
-                    stream=False,
-                    settings=None,
-                    log_query=False,
-                    max_attempts=max_attempts,
-                    max_interval=max_interval,
-                )
-            else:
-                execute_query(
-                    ctx,
-                    "SELECT 1",
-                    timeout=timeout,
-                    replica=replica,
-                    log_query=False,
-                )
+            execute_query(
+                ctx,
+                "SELECT 1",
+                timeout=timeout,
+                replica=replica,
+                log_query=False,
+                retry_on_transient_errors=retry_on_transient_errors,
+                retry_max_attempts=max_attempts,
+                retry_max_interval=max_interval,
+            )
         except Exception:
             # Replica is unavailable
             logging.error(f"Replica {replica} is unavailable")
             return False
 
     return True
-
-
-def _is_retryable_error(error: BaseException) -> bool:
-    """
-    Determine if an error is transient and can be retried.
-
-    Retryable errors:
-    - requests.exceptions.Timeout, ReadTimeout (transient network issues)
-    - HTTP 408, 500, 503 from ClickHouse (TIMEOUT_EXCEEDED, internal errors, SOCKET_TIMEOUT)
-    - requests.exceptions.ChunkedEncodingError (transient network)
-
-    Non-retryable errors:
-    - requests.exceptions.ConnectionError (node unavailable/not started)
-    - HTTP 4xx (client errors: syntax, permissions, unknown tables, etc.)
-    - HTTP 429, 502, 504 (not returned by ClickHouse directly - proxy errors)
-    - Schema errors
-    """
-    # Direct timeout errors are retryable
-    if isinstance(
-        error, (requests.exceptions.Timeout, requests.exceptions.ReadTimeout)
-    ):
-        return True
-
-    # ChunkedEncodingError is typically transient
-    if isinstance(error, requests.exceptions.ChunkedEncodingError):
-        return True
-
-    # ClickHouse HTTP errors - check status code
-    if isinstance(error, ClickhouseError):
-        retryable_status_codes = {408, 500, 503}
-        status_code = error.response.status_code if error.response else None
-        return status_code in retryable_status_codes
-
-    # ConnectionError means node is unavailable - not retryable
-    if isinstance(error, requests.exceptions.ConnectionError):
-        return False
-
-    return False
-
-
-def _execute_query_with_retry(
-    ctx: Context,
-    query: Any,
-    replica: str,
-    timeout: Optional[int],
-    echo: bool,
-    dry_run: bool,
-    format_: Optional[str],
-    stream: bool,
-    settings: Optional[Any],
-    log_query: bool,
-    max_attempts: int,
-    max_interval: int,
-    **kwargs: Any,
-) -> Any:
-    """
-    Execute query on a specific replica with retry logic for transient errors.
-    """
-
-    def log_before_sleep(rcs: RetryCallState) -> None:
-        if rcs.outcome is None or rcs.next_action is None:
-            return
-        logging.warning(
-            f"Query on replica {replica} failed (attempt {rcs.attempt_number}/{max_attempts}): "
-            f"{rcs.outcome.exception()}. Retrying in {rcs.next_action.sleep:.2f}s..."
-        )
-
-    retry_decorator = retry(
-        retry=retry_if_exception(_is_retryable_error),
-        stop=stop_after_attempt(max_attempts),
-        wait=wait_random_exponential(max=max_interval),
-        before_sleep=log_before_sleep,
-        reraise=True,
-    )
-
-    return retry_decorator(execute_query)(
-        ctx,
-        query,
-        timeout=timeout,
-        echo=echo,
-        dry_run=dry_run,
-        format_=format_,
-        stream=stream,
-        settings=settings,
-        replica=replica,
-        log_query=log_query,
-        **kwargs,
-    )
 
 
 def execute_query_on_shard(
@@ -258,7 +156,6 @@ def execute_query_on_shard(
     """
     replicas = ClickhouseInfo.get_replicas(ctx)
 
-    # Get retry settings from config if retry is enabled
     max_attempts = (
         retry_max_attempts
         or ctx.obj["config"]["object_storage"]["shard_query_retries"]["max_attempts"]
@@ -268,40 +165,23 @@ def execute_query_on_shard(
         or ctx.obj["config"]["object_storage"]["shard_query_retries"]["max_interval"]
     )
 
-    if retry_on_transient_errors:
-
-        for replica in replicas:
-            _execute_query_with_retry(
-                ctx,
-                query,
-                replica,
-                timeout=timeout,
-                echo=echo or False,
-                dry_run=dry_run or False,
-                format_=format_,
-                stream=stream,
-                settings=settings,
-                log_query=log_query,
-                max_attempts=max_attempts,
-                max_interval=max_interval,
-                **kwargs,
-            )
-    else:
-        # Original behavior without retry
-        for replica in replicas:
-            execute_query(
-                ctx,
-                query,
-                timeout=timeout,
-                echo=echo,
-                dry_run=dry_run,
-                format_=format_,
-                stream=stream,
-                settings=settings,
-                replica=replica,
-                log_query=log_query,
-                **kwargs,
-            )
+    for replica in replicas:
+        execute_query(
+            ctx,
+            query,
+            timeout=timeout,
+            echo=echo,
+            dry_run=dry_run,
+            format_=format_,
+            stream=stream,
+            settings=settings,
+            replica=replica,
+            log_query=log_query,
+            retry_on_transient_errors=retry_on_transient_errors,
+            retry_max_attempts=max_attempts,
+            retry_max_interval=max_interval,
+            **kwargs,
+        )
 
 
 def get_remote_table_for_hosts(ctx: Context, table: str, replicas: list[str]) -> str:

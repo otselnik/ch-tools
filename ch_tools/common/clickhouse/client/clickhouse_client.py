@@ -4,6 +4,7 @@ from datetime import timedelta
 from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
+import tenacity
 from click import Context
 from jinja2 import Environment
 from typing_extensions import Self
@@ -15,7 +16,7 @@ from ch_tools.common.utils import version_ge
 from ..config import get_clickhouse_config
 from ..config.clickhouse import ClickhousePort
 from .error import ClickhouseError
-from .retry import retry
+from .retry import _log_retry_attempt, is_transient_error
 from .utils import _format_str_imatch, _format_str_match
 
 PORTS_PRIORITY = [
@@ -168,10 +169,68 @@ class ClickhouseClient:
 
         return response.strip()
 
-    @retry(requests.exceptions.ConnectionError)
     def query(
         self: Self,
-        query: Union[str, Query],
+        query: Optional[Union[str, Query]],
+        query_args: Optional[Dict[str, Any]] = None,
+        format_: Optional[str] = None,
+        post_data: Any = None,
+        timeout: Optional[int] = None,
+        echo: bool = False,
+        dry_run: bool = False,
+        stream: bool = False,
+        settings: Optional[dict] = None,
+        host: Optional[str] = None,
+        port: Optional[ClickhousePort] = None,
+        log_query: bool = True,
+        retry_on_transient_errors: bool = False,
+        retry_max_attempts: Optional[int] = None,
+        retry_max_interval: Optional[int] = None,
+    ) -> Any:
+        """
+        Execute query.
+
+        ``query`` may be ``None`` to perform a connectivity check (used by
+        :meth:`ping`); in that case an HTTP GET to the server root is issued.
+
+        By default, preserves the historical retry behavior and retries only
+        connection errors. Set ``retry_on_transient_errors`` to additionally
+        retry Timeout, ReadTimeout, ChunkedEncodingError, and ClickhouseError
+        with retryable status codes (408, 429, 500, 502, 503, 504).
+        """
+        predicate = (
+            is_transient_error
+            if retry_on_transient_errors
+            else lambda exc: isinstance(exc, requests.exceptions.ConnectionError)
+        )
+        max_attempts = retry_max_attempts if retry_max_attempts is not None else 5
+        max_interval = retry_max_interval if retry_max_interval is not None else 5
+        retrying = tenacity.Retrying(
+            retry=tenacity.retry_if_exception(predicate),
+            wait=tenacity.wait_random_exponential(multiplier=0.5, max=max_interval),
+            stop=tenacity.stop_after_attempt(max_attempts),
+            before_sleep=_log_retry_attempt,
+            reraise=True,
+        )
+        return retrying(
+            self._execute_query_impl,
+            query=query,
+            query_args=query_args,
+            format_=format_,
+            post_data=post_data,
+            timeout=timeout,
+            echo=echo,
+            dry_run=dry_run,
+            stream=stream,
+            settings=settings,
+            host=host,
+            port=port,
+            log_query=log_query,
+        )
+
+    def _execute_query_impl(
+        self: Self,
+        query: Optional[Union[str, Query]],
         query_args: Optional[Dict[str, Any]] = None,
         format_: Optional[str] = None,
         post_data: Any = None,
@@ -185,19 +244,20 @@ class ClickhouseClient:
         log_query: bool = True,
     ) -> Any:
         """
-        Execute query.
+        Internal query execution logic (without retry).
         """
-        if isinstance(query, str):
-            query = Query(query)
+        if query is not None:
+            if isinstance(query, str):
+                query = Query(query)
 
-        if query_args:
-            query.value = self.render_query(query.value, **query_args)
+            if query_args:
+                query.value = self.render_query(query.value, **query_args)
 
-        if format_:
-            query += f" FORMAT {format_}"
+            if format_:
+                query += f" FORMAT {format_}"
 
-        if echo:
-            print(str(query), "\n")
+            if echo:
+                print(str(query), "\n")
 
         if dry_run:
             return None
