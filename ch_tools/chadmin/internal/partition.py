@@ -29,7 +29,7 @@ def drop_partition(
     """
     Drop the specified table partition.
     """
-    query = f"ALTER TABLE `{database}`.`{table}` DROP PARTITION ID IF EXISTS '{partition_id}'"
+    query = f"ALTER TABLE `{database}`.`{table}` DROP PARTITION ID '{partition_id}'"
     _execute_query(ctx, query, dry_run)
 
 
