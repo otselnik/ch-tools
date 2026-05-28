@@ -1,11 +1,13 @@
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import boto3
 from boto3 import client as Boto3Client
+from botocore.exceptions import ClientError
 from click import Context, group, option, pass_context
 from cloup.constraints import AcceptAtMost, constraint
 
@@ -18,8 +20,11 @@ from ch_tools.chadmin.internal.clickhouse_disks import (
     make_ch_disks_config,
     remove_from_ch_disk,
 )
+from ch_tools.chadmin.internal.object_storage.part_file_classifier import (
+    UNRECOVERABLE,
+    classify_part,
+)
 from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
-    S3ObjectLocalInfo,
     S3ObjectLocalMetaData,
 )
 from ch_tools.chadmin.internal.system import get_version
@@ -372,8 +377,11 @@ def collect_orphaned_sql_objects_recursive(
 )
 @constraint(AcceptAtMost(1), ["detach", "reattach"])
 @pass_context
-def detect_broken_partitions(
-    ctx: Context, root_path: str, reattach: bool, detach: bool
+def detect_broken_partitions(  # pylint: disable=too-many-locals
+    ctx: Context,
+    root_path: str,
+    reattach: bool,
+    detach: bool,
 ) -> None:
     ch_config = get_clickhouse_config(ctx)
 
@@ -388,63 +396,100 @@ def detect_broken_partitions(
         aws_access_key_id=disk_conf.access_key_id,
         aws_secret_access_key=disk_conf.secret_access_key,
     )
-    repaired_partitions: Set[TablePartition] = set()
 
+    # Pass 1: walk the metadata tree, collect (part_path -> [(filename, key)])
+    parts: List[Tuple[str, List[Tuple[str, str]]]] = []
+    keys_to_check: Set[str] = set()
     for path, _, files in os.walk(root_path):
-        objects: List[S3ObjectLocalInfo] = []
-        logging.debug(f"Checking files from: {path}")
+        if not files:
+            continue
+        logging.debug("Checking files from: {}", path)
+        part_files: List[Tuple[str, str]] = []
         for file in files:
+            file_full_path = Path(os.path.join(path, file))
             try:
-                file_full_path = Path(os.path.join(path, file))
-                objects.extend(S3ObjectLocalMetaData.from_file(file_full_path).objects)
+                meta = S3ObjectLocalMetaData.from_file(file_full_path)
             except Exception as e:
-                logging.error("Failed to perform extend objects: {!r}", e)
-
-        for s3_object in objects:
-            if s3_object.key_is_full:
-                object_storage_key = s3_object.key
-            else:
-                object_storage_key = os.path.join(disk_conf.prefix, s3_object.key)
-
-            if check_key_in_object_storage(
-                s3_client, disk_conf.bucket_name, object_storage_key
-            ):
+                logging.error(
+                    "Failed to read S3 metadata for {}: {!r}", file_full_path, e
+                )
                 continue
-
-            logging.debug("Not found key {}", object_storage_key)
-
-            table_partition = get_partition_by_path(ctx, path)
-
-            if table_partition is None:
-                logging.warning("Skip failed path {}.", path)
-                break
-
-            if table_partition not in repaired_partitions:
-                repaired_partitions.add(table_partition)
-
-                logging.debug(
-                    "Found the partition with missing blob in the object storage: path={} table={} partition={} ",
-                    path,
-                    table_partition.table,
-                    table_partition.partition,
+            for obj in meta.objects:
+                key = (
+                    obj.key
+                    if obj.key_is_full
+                    else os.path.join(disk_conf.prefix, obj.key)
                 )
-                if detach:
-                    try_repair_partition(ctx, table_partition, False)
-                elif reattach:
-                    try_repair_partition(ctx, table_partition)
-            else:
-                logging.debug(
-                    "Partition {} for table {} was already repared. Skip.",
-                    table_partition.partition,
-                    table_partition.table,
-                )
+                rel = os.path.relpath(str(file_full_path), path)
+                part_files.append((rel, key))
+                keys_to_check.add(key)
+        if part_files:
+            parts.append((path, part_files))
 
-            break
+    # Pass 2: batch existence check for all unique keys (head_object + cache).
+    existing_keys = _check_keys_exist(s3_client, disk_conf.bucket_name, keys_to_check)
+
+    # Pass 3: per-part classification.
+    broken_parts: List[Dict[str, Any]] = []
+    for path, part_files in parts:
+        missing = [rel for rel, key in part_files if key not in existing_keys]
+        if not missing:
+            continue
+        table_partition = get_partition_by_path(ctx, path)
+        part_type = _get_part_type_by_path(ctx, path)
+        critical = _get_critical_columns(ctx, table_partition)
+        status = classify_part(missing, part_type=part_type, critical_columns=critical)
+        broken_parts.append(
+            {
+                "path": path,
+                "table": table_partition.table if table_partition else None,
+                "partition": table_partition.partition if table_partition else None,
+                "part_type": part_type,
+                "missing_files": missing,
+                "status": status,
+            }
+        )
+
+    # Pass 4: apply the requested action.
+    #   --detach   -> DETACH every broken part
+    #   --reattach -> DETACH+ATTACH only for parts that have a chance to
+    #                 be reattached cleanly. Reattaching an unrecoverable
+    #                 part just lands it in detached/broken-on-start_*.
+    repaired_partitions: Set[TablePartition] = set()
+    for part in broken_parts:
+        if part["table"] is None:
+            logging.warning("Skip failed path {}.", part["path"])
+            continue
+        table_partition = TablePartition(part["table"], part["partition"])
+        if table_partition in repaired_partitions:
+            continue
+        logging.debug(
+            "Broken part path={} table={} partition={} status={}",
+            part["path"],
+            table_partition.table,
+            table_partition.partition,
+            part["status"],
+        )
+        if detach:
+            repaired_partitions.add(table_partition)
+            try_repair_partition(ctx, table_partition, False)
+        elif reattach:
+            if part["status"] == UNRECOVERABLE:
+                logging.debug(
+                    "Skip --reattach for unrecoverable part {}.", part["path"]
+                )
+                continue
+            repaired_partitions.add(table_partition)
+            try_repair_partition(ctx, table_partition)
+        else:
+            # No flag — still surface the partition in the regular output.
+            repaired_partitions.add(table_partition)
 
     print_partitions(ctx, repaired_partitions)
 
     logging.debug(
-        "Found parts with missing s3 keys. Local paths of parts: {}",
+        "Found {} broken part(s); affected partitions: {}",
+        len(broken_parts),
         repaired_partitions,
     )
 
@@ -461,20 +506,75 @@ def try_repair_partition(
         attach_partition(ctx, table_partition)
 
 
-def check_key_in_object_storage(s3_client: Boto3Client, bucket: str, key: str) -> bool:
-    """
-    Check that object exists in s3 bucket with the specified key.
-    """
-    s3_resp = s3_client.list_objects_v2(
-        Bucket=bucket,
-        Prefix=key,
+def _check_keys_exist(s3_client: Boto3Client, bucket: str, keys: Set[str]) -> Set[str]:
+    """Return the subset of ``keys`` that actually exists in S3."""
+    existing: Set[str] = set()
+    for key in keys:
+        try:
+            s3_client.head_object(Bucket=bucket, Key=key)
+            existing.add(key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+                continue
+            logging.warning(
+                "head_object failed for key={} bucket={}: {!r}", key, bucket, exc
+            )
+            # Treat ambiguous failures as "exists" so we don't trigger
+            # destructive actions on transient errors.
+            existing.add(key)
+    return existing
+
+
+def _get_part_type_by_path(ctx: Context, path: str) -> Optional[str]:
+    query = (
+        "SELECT part_type FROM system.parts "
+        f"WHERE path = '{path}/' AND active LIMIT 1"
     )
-    if "Contents" not in s3_resp:
-        return False
-    if len(s3_resp["Contents"]) != 1:
-        return False
-    res = s3_resp["Contents"][0]["Key"] == key
-    return res
+    res = execute_query(ctx, query, format_=OutputFormat.JSONCompact)
+    if not res.get("data"):
+        return None
+    return res["data"][0][0]
+
+
+def _get_critical_columns(
+    ctx: Context, table_partition: Optional["TablePartition"]
+) -> List[str]:
+    """Return columns participating in PARTITION BY / ORDER BY."""
+    if table_partition is None:
+        return []
+    # table_partition.table is already quoted as `db`.`name` — split it back.
+    try:
+        db, name = table_partition.table.strip("`").split("`.`")
+    except ValueError:
+        return []
+    query = (
+        "SELECT sorting_key, partition_key FROM system.tables "
+        f"WHERE database = '{db}' AND name = '{name}' LIMIT 1"
+    )
+    res = execute_query(ctx, query, format_=OutputFormat.JSONCompact)
+    if not res.get("data"):
+        return []
+    sorting_key, partition_key = res["data"][0]
+    return _extract_columns(sorting_key) + _extract_columns(partition_key)
+
+
+def _extract_columns(key_expression: str) -> List[str]:
+    """Extract bare column identifiers from a CH key expression.
+
+    Drops function names so e.g. ``cityHash64(a), b`` yields ``[a, b]``.
+    """
+    if not key_expression:
+        return []
+
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", key_expression)
+    result: List[str] = []
+    for tok in tokens:
+        if re.search(r"\b" + re.escape(tok) + r"\s*\(", key_expression):
+            continue
+        result.append(tok)
+    return result
 
 
 def get_partition_by_path(ctx: Context, path: str) -> Optional[TablePartition]:
