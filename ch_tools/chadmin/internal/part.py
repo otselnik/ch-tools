@@ -353,7 +353,7 @@ def drop_part(
     Drop the specified data part.
     """
     timeout = ctx.obj["config"]["clickhouse"]["alter_table_timeout"]
-    query = f"ALTER TABLE `{database}`.`{table}` DROP PART '{part_name}'"
+    query = f"ALTER TABLE `{database}`.`{table}` DROP PART IF EXISTS '{part_name}'"
     execute_query(ctx, query, timeout=timeout, format_=None, echo=True, dry_run=dry_run)
 
 
@@ -368,7 +368,7 @@ def drop_detached_part(
     Drop the specified detached data part.
     """
     timeout = ctx.obj["config"]["clickhouse"]["alter_table_timeout"]
-    query = f"ALTER TABLE `{database}`.`{table}` DROP DETACHED PART '{part_name}'"
+    query = f"ALTER TABLE `{database}`.`{table}` DROP DETACHED PART IF EXISTS '{part_name}'"
     execute_query(ctx, query, timeout=timeout, format_=None, echo=True, dry_run=dry_run)
 
 

@@ -231,7 +231,7 @@ def detach_table(
     logging.info("Detaching table `{}`.`{}`", database_name, table_name)
     timeout = ctx.obj["config"]["clickhouse"]["detach_table_timeout"]
     query = """
-        DETACH TABLE `{{ database_name }}`.`{{ table_name }}`
+        DETACH TABLE IF EXISTS `{{ database_name }}`.`{{ table_name }}`
         {%- if cluster %}
         ON CLUSTER '{{ cluster }}'
         {%- endif %}
@@ -267,7 +267,7 @@ def attach_table(
     logging.info("Attaching table `{}`.`{}`", database_name, table_name)
     timeout = ctx.obj["config"]["clickhouse"]["attach_table_timeout"]
     query = """
-        ATTACH TABLE `{{ database_name }}`.`{{ table_name }}`
+        ATTACH TABLE IF NOT EXISTS `{{ database_name }}`.`{{ table_name }}`
         {%- if cluster %}
         ON CLUSTER '{{ cluster }}'
         {%- endif %}

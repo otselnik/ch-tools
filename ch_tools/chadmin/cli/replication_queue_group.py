@@ -162,7 +162,7 @@ def delete_command(ctx: Context, **kwargs: Any) -> None:
         logging.info("Detaching table `{}`.`{}`", database, table)
         execute_query(
             ctx,
-            f"""DETACH TABLE `{database}`.`{table}`""",
+            f"""DETACH TABLE IF EXISTS `{database}`.`{table}`""",
             timeout=300,
             echo=True,
             format_=None,
@@ -176,7 +176,7 @@ def delete_command(ctx: Context, **kwargs: Any) -> None:
         logging.info("Attaching table `{}`.`{}`", database, table)
         execute_query(
             ctx,
-            f"""ATTACH TABLE `{database}`.`{table}`""",
+            f"""ATTACH TABLE IF NOT EXISTS `{database}`.`{table}`""",
             timeout=300,
             echo=True,
             format_=None,
