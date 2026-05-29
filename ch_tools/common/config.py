@@ -32,6 +32,10 @@ DEFAULT_CONFIG = {
         "monitoring_password": None,
         "distributed_ddl_path": "/clickhouse/task_queue/ddl",
         "timeout": 60,
+        "retries": {
+            "max_attempts": 5,
+            "max_interval": 5,
+        },
         "attach_table_timeout": 10 * 60,
         "detach_table_timeout": 10 * 60,
         "alter_table_timeout": 10 * 60,

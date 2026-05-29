@@ -220,8 +220,8 @@ def detach_table(
     permanently: Optional[bool] = True,
     *,
     cluster: Optional[bool] = None,
-    echo: Optional[bool] = False,
-    dry_run: Optional[bool] = False,
+    echo: bool = False,
+    dry_run: bool = False,
 ) -> None:
     """
     Perform "DETACH TABLE" for the specified table.
@@ -258,8 +258,8 @@ def attach_table(
     table_name: str,
     *,
     cluster: Optional[bool] = None,
-    echo: Optional[bool] = False,
-    dry_run: Optional[bool] = False,
+    echo: bool = False,
+    dry_run: bool = False,
 ) -> None:
     """
     Perform "ATTACH TABLE" for the specified table.

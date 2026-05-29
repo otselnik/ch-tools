@@ -52,8 +52,8 @@ def execute_query(
     ctx: Context,
     query: Any,
     timeout: Optional[int] = None,
-    echo: Optional[bool] = False,
-    dry_run: Optional[bool] = False,
+    echo: bool = False,
+    dry_run: bool = False,
     format_: Optional[str] = "default",
     stream: bool = False,
     settings: Optional[Any] = None,
@@ -83,19 +83,51 @@ def execute_query(
     )
 
 
+def check_replicas_availability(
+    ctx: Context,
+    timeout: int = 5,
+) -> bool:
+    """
+    Check if all replicas in the shard are available by executing a lightweight query.
+
+    Returns True if all replicas are available, False otherwise.
+    """
+    replicas = ClickhouseInfo.get_replicas(ctx)
+
+    for replica in replicas:
+        try:
+            execute_query(
+                ctx,
+                "SELECT 1",
+                timeout=timeout,
+                replica=replica,
+                log_query=False,
+            )
+        except Exception:
+            # Replica is unavailable
+            logging.error(f"Replica {replica} is unavailable")
+            return False
+
+    return True
+
+
 def execute_query_on_shard(
     ctx: Context,
     query: str,
     timeout: Optional[int] = None,
-    echo: Optional[bool] = False,
-    dry_run: Optional[bool] = False,
+    echo: bool = False,
+    dry_run: bool = False,
     format_: Optional[str] = "default",
     stream: bool = False,
     settings: Optional[Any] = None,
     log_query: bool = True,
     **kwargs: Any,
 ) -> None:
+    """
+    Execute query on all replicas in the shard.
+    """
     replicas = ClickhouseInfo.get_replicas(ctx)
+
     for replica in replicas:
         execute_query(
             ctx,

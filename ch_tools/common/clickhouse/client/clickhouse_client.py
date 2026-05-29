@@ -4,6 +4,7 @@ from datetime import timedelta
 from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
+import tenacity
 from click import Context
 from jinja2 import Environment
 from typing_extensions import Self
@@ -15,7 +16,7 @@ from ch_tools.common.utils import version_ge
 from ..config import get_clickhouse_config
 from ..config.clickhouse import ClickhousePort
 from .error import ClickhouseError
-from .retry import retry
+from .retry import _log_retry_attempt, is_transient_error
 from .utils import _format_str_imatch, _format_str_match
 
 PORTS_PRIORITY = [
@@ -26,7 +27,7 @@ PORTS_PRIORITY = [
 ]
 
 
-class ClickhouseClient:
+class ClickhouseClient:  # pylint: disable=too-many-instance-attributes
     """
     ClickHouse client wrapper.
     """
@@ -42,6 +43,8 @@ class ClickhouseClient:
         cert_path: Optional[str] = None,
         timeout: int,
         settings: Optional[Dict[str, Any]] = None,
+        retry_max_attempts: int = 5,
+        retry_max_interval: int = 5,
     ) -> None:
         self.host = host
         self.insecure = insecure
@@ -51,6 +54,8 @@ class ClickhouseClient:
         self.password = password
         self._settings = settings or {}
         self._timeout = timeout
+        self._retry_max_attempts = retry_max_attempts
+        self._retry_max_interval = retry_max_interval
         self._ch_version: Optional[str] = None
 
     def get_clickhouse_version(self) -> str:
@@ -168,10 +173,9 @@ class ClickhouseClient:
 
         return response.strip()
 
-    @retry(requests.exceptions.ConnectionError)
     def query(
         self: Self,
-        query: Union[str, Query],
+        query: Optional[Union[str, Query]],
         query_args: Optional[Dict[str, Any]] = None,
         format_: Optional[str] = None,
         post_data: Any = None,
@@ -186,18 +190,69 @@ class ClickhouseClient:
     ) -> Any:
         """
         Execute query.
+
+        ``query`` may be ``None`` to perform a connectivity check (used by
+        :meth:`ping`); in that case an HTTP GET to the server root is issued.
+
+        Retries transient errors (ConnectionError, Timeout, ReadTimeout,
+        ChunkedEncodingError, and ClickhouseError with status codes
+        408, 429, 500, 502, 503, 504) using exponential back-off.
         """
-        if isinstance(query, str):
-            query = Query(query)
+        retrying = tenacity.Retrying(
+            retry=tenacity.retry_if_exception(is_transient_error),
+            wait=tenacity.wait_random_exponential(
+                multiplier=0.5, max=self._retry_max_interval
+            ),
+            stop=tenacity.stop_after_attempt(self._retry_max_attempts),
+            before_sleep=_log_retry_attempt,
+            reraise=True,
+        )
+        return retrying(
+            self._execute_query_impl,
+            query=query,
+            query_args=query_args,
+            format_=format_,
+            post_data=post_data,
+            timeout=timeout,
+            echo=echo,
+            dry_run=dry_run,
+            stream=stream,
+            settings=settings,
+            host=host,
+            port=port,
+            log_query=log_query,
+        )
 
-        if query_args:
-            query.value = self.render_query(query.value, **query_args)
+    def _execute_query_impl(
+        self: Self,
+        query: Optional[Union[str, Query]],
+        query_args: Optional[Dict[str, Any]] = None,
+        format_: Optional[str] = None,
+        post_data: Any = None,
+        timeout: Optional[int] = None,
+        echo: bool = False,
+        dry_run: bool = False,
+        stream: bool = False,
+        settings: Optional[dict] = None,
+        host: Optional[str] = None,
+        port: Optional[ClickhousePort] = None,
+        log_query: bool = True,
+    ) -> Any:
+        """
+        Internal query execution logic (without retry).
+        """
+        if query is not None:
+            if isinstance(query, str):
+                query = Query(query)
 
-        if format_:
-            query += f" FORMAT {format_}"
+            if query_args:
+                query.value = self.render_query(query.value, **query_args)
 
-        if echo:
-            print(str(query), "\n")
+            if format_:
+                query += f" FORMAT {format_}"
+
+            if echo:
+                print(str(query), "\n")
 
         if dry_run:
             return None
@@ -300,6 +355,7 @@ def clickhouse_client(ctx: Context) -> ClickhouseClient:
     if not ctx.obj.get("chcli"):
         ch_server_config = get_clickhouse_config(ctx)
         tools_config = ctx.obj["config"]["clickhouse"]
+        retries_cfg = tools_config["retries"]
         user, password = clickhouse_credentials(ctx)
         ctx.obj["chcli"] = ClickhouseClient(
             host=tools_config["host"],
@@ -310,6 +366,8 @@ def clickhouse_client(ctx: Context) -> ClickhouseClient:
             insecure=tools_config["insecure"],
             timeout=tools_config["timeout"],
             settings=tools_config["settings"],
+            retry_max_attempts=retries_cfg["max_attempts"],
+            retry_max_interval=retries_cfg["max_interval"],
         )
 
     return ctx.obj["chcli"]
