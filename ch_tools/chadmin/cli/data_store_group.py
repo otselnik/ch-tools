@@ -492,6 +492,11 @@ def detect_broken_partitions(  # pylint: disable=too-many-locals,too-many-branch
                 s3_prefix=disk_conf.prefix,
                 part_path=part["path"],
                 missing_files=part["missing_files"],
+                disk_name="object_storage",
+                disk_config=ch_config.storage_configuration.get_disk_config(
+                    "object_storage"
+                ),
+                ch_version=get_version(ctx),
             )
             recovery_results.append(result)
             restored = result.reattached
@@ -524,13 +529,21 @@ def detect_broken_partitions(  # pylint: disable=too-many-locals,too-many-branch
 def _restore_recoverable_part(
     ctx: Context,
     *,
-    s3_client: Boto3Client,
+    s3_client: "Boto3Client",
     bucket: str,
     s3_prefix: str,
     part_path: str,
     missing_files: List[str],
+    disk_name: Optional[str] = None,
+    disk_config: Optional[dict] = None,
+    ch_version: Optional[str] = None,
 ) -> PartRecoveryResult:
-    """DETACH PART → regenerate missing files → ATTACH PART."""
+    """DETACH PART → regenerate missing files → ATTACH PART.
+
+    ``disk_name``, ``disk_config``, and ``ch_version`` are forwarded to
+    :func:`recover_part_files_locally` for the ``checksums.txt`` recovery
+    path on ``ReplicatedMergeTree`` tables (via ``clickhouse-local``).
+    """
     recovery_ctx = get_part_recovery_context(ctx, part_path)
     result = PartRecoveryResult(
         part_path=part_path,
@@ -568,6 +581,10 @@ def _restore_recoverable_part(
         s3_client=s3_client,
         bucket=bucket,
         s3_prefix=s3_prefix,
+        ctx=ctx,
+        disk_name=disk_name,
+        disk_config=disk_config,
+        ch_version=ch_version,
     )
 
     try:
