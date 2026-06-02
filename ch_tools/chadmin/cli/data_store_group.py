@@ -9,7 +9,6 @@ import boto3
 from boto3 import client as Boto3Client
 from botocore.exceptions import ClientError
 from click import Context, group, option, pass_context
-from cloup.constraints import AcceptAtMost, constraint
 
 from ch_tools.chadmin.cli.chadmin_group import Chadmin
 from ch_tools.chadmin.internal.clickhouse_disks import (
@@ -21,12 +20,19 @@ from ch_tools.chadmin.internal.clickhouse_disks import (
     remove_from_ch_disk,
 )
 from ch_tools.chadmin.internal.object_storage.part_file_classifier import (
+    RECOVERABLE,
     UNRECOVERABLE,
     classify_part,
+)
+from ch_tools.chadmin.internal.object_storage.part_recovery import (
+    PartRecoveryResult,
+    get_part_recovery_context,
+    recover_part_files_locally,
 )
 from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     S3ObjectLocalMetaData,
 )
+from ch_tools.chadmin.internal.part import attach_part, detach_part
 from ch_tools.chadmin.internal.system import get_version
 from ch_tools.chadmin.internal.utils import execute_query, remove_from_disk
 from ch_tools.common import logging
@@ -364,23 +370,28 @@ def collect_orphaned_sql_objects_recursive(
     help="Set the store subdirectory path.",
 )
 @option(
-    "--reattach",
+    "--restore-recoverable",
+    "restore_recoverable",
     is_flag=True,
     default=False,
-    help="Flag to reattach broken partitions.",
+    help=(
+        "For broken parts classified as recoverable, regenerate their "
+        "missing structural files via DETACH PART + recovery + ATTACH "
+        "PART. Compatible with --detach: unrecoverable parts are detached, "
+        "recoverable ones are restored."
+    ),
 )
 @option(
     "--detach",
     is_flag=True,
     default=False,
-    help="Flag to detach broken partitions.",
+    help="Detach unrecoverable broken parts (whole partitions).",
 )
-@constraint(AcceptAtMost(1), ["detach", "reattach"])
 @pass_context
-def detect_broken_partitions(  # pylint: disable=too-many-locals
+def detect_broken_partitions(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     ctx: Context,
     root_path: str,
-    reattach: bool,
+    restore_recoverable: bool,
     detach: bool,
 ) -> None:
     ch_config = get_clickhouse_config(ctx)
@@ -451,18 +462,19 @@ def detect_broken_partitions(  # pylint: disable=too-many-locals
         )
 
     # Pass 4: apply the requested action.
-    #   --detach   -> DETACH every broken part
-    #   --reattach -> DETACH+ATTACH only for parts that have a chance to
-    #                 be reattached cleanly. Reattaching an unrecoverable
-    #                 part just lands it in detached/broken-on-start_*.
+    #   --restore-recoverable -> per-recoverable-part: DETACH PART, regenerate
+    #                            missing structural files, ATTACH PART.
+    #   --detach              -> DETACH (whole partition) for parts that did
+    #                            not get restored. Compatible with the flag
+    #                            above: restore is attempted first.
+    #   no flag               -> just report.
     repaired_partitions: Set[TablePartition] = set()
+    recovery_results: List[PartRecoveryResult] = []
     for part in broken_parts:
         if part["table"] is None:
             logging.warning("Skip failed path {}.", part["path"])
             continue
         table_partition = TablePartition(part["table"], part["partition"])
-        if table_partition in repaired_partitions:
-            continue
         logging.debug(
             "Broken part path={} table={} partition={} status={}",
             part["path"],
@@ -470,22 +482,37 @@ def detect_broken_partitions(  # pylint: disable=too-many-locals
             table_partition.partition,
             part["status"],
         )
-        if detach:
-            repaired_partitions.add(table_partition)
-            try_repair_partition(ctx, table_partition, False)
-        elif reattach:
-            if part["status"] == UNRECOVERABLE:
-                logging.debug(
-                    "Skip --reattach for unrecoverable part {}.", part["path"]
-                )
-                continue
-            repaired_partitions.add(table_partition)
-            try_repair_partition(ctx, table_partition)
-        else:
-            # No flag — still surface the partition in the regular output.
-            repaired_partitions.add(table_partition)
+
+        restored = False
+        if restore_recoverable and part["status"] == RECOVERABLE:
+            result = _restore_recoverable_part(
+                ctx,
+                s3_client=s3_client,
+                bucket=disk_conf.bucket_name,
+                s3_prefix=disk_conf.prefix,
+                part_path=part["path"],
+                missing_files=part["missing_files"],
+            )
+            recovery_results.append(result)
+            restored = result.reattached
+
+        if not restored:
+            if part["status"] == UNRECOVERABLE and detach:
+                if table_partition not in repaired_partitions:
+                    repaired_partitions.add(table_partition)
+                    # Whole-partition DETACH as the last-resort fallback.
+                    # Reattach is intentionally not attempted — the part
+                    # would just land in detached/broken-on-start_* again.
+                    detach_partition(ctx, table_partition)
+            else:
+                # Still surface the partition so the operator sees it.
+                repaired_partitions.add(table_partition)
 
     print_partitions(ctx, repaired_partitions)
+
+    if recovery_results:
+        for r in recovery_results:
+            logging.info("Recovery result: {}", r.to_dict())
 
     logging.debug(
         "Found {} broken part(s); affected partitions: {}",
@@ -494,16 +521,88 @@ def detect_broken_partitions(  # pylint: disable=too-many-locals
     )
 
 
-def try_repair_partition(
-    ctx: Context, table_partition: TablePartition, attach: bool = True
-) -> None:
-    """
-    Try to repair broken partition with DETACH and optional ATTACH.
-    """
-    detach_partition(ctx, table_partition)
+def _restore_recoverable_part(
+    ctx: Context,
+    *,
+    s3_client: Boto3Client,
+    bucket: str,
+    s3_prefix: str,
+    part_path: str,
+    missing_files: List[str],
+) -> PartRecoveryResult:
+    """DETACH PART → regenerate missing files → ATTACH PART."""
+    recovery_ctx = get_part_recovery_context(ctx, part_path)
+    result = PartRecoveryResult(
+        part_path=part_path,
+        part_name=recovery_ctx.part_name if recovery_ctx else None,
+        table=recovery_ctx.quoted_table if recovery_ctx else None,
+    )
+    if recovery_ctx is None:
+        result.error = "no recovery context (part missing in system.parts)"
+        return result
 
-    if attach:
-        attach_partition(ctx, table_partition)
+    try:
+        detach_part(
+            ctx, recovery_ctx.database, recovery_ctx.table, recovery_ctx.part_name
+        )
+        result.detached = True
+    except Exception as exc:
+        result.error = f"DETACH PART failed: {exc!r}"
+        logging.warning(
+            "DETACH PART '{}' on {} failed: {!r}",
+            recovery_ctx.part_name,
+            recovery_ctx.quoted_table,
+            exc,
+        )
+        return result
+
+    detached_part_path = _find_detached_part_path(part_path, recovery_ctx.part_name)
+    if detached_part_path is None:
+        result.error = "detached part directory not found after DETACH PART"
+        return result
+
+    result.files = recover_part_files_locally(
+        part_path=detached_part_path,
+        missing_files=missing_files,
+        recovery_ctx=recovery_ctx,
+        s3_client=s3_client,
+        bucket=bucket,
+        s3_prefix=s3_prefix,
+    )
+
+    try:
+        attach_part(
+            ctx, recovery_ctx.database, recovery_ctx.table, recovery_ctx.part_name
+        )
+        result.reattached = True
+    except Exception as exc:
+        result.error = f"ATTACH PART failed: {exc!r}"
+        logging.warning(
+            "ATTACH PART '{}' on {} failed: {!r}",
+            recovery_ctx.part_name,
+            recovery_ctx.quoted_table,
+            exc,
+        )
+    return result
+
+
+def _find_detached_part_path(active_path: str, part_name: str) -> Optional[str]:
+    """
+    Locate the directory of a part that has just been DETACHed.
+
+    The active part path looks like ``…/<table>/<part_name>``; its
+    detached counterpart sits next to it as ``…/<table>/detached/<part_name>``.
+    """
+    table_dir = os.path.dirname(active_path.rstrip("/"))
+    candidate = os.path.join(table_dir, "detached", part_name)
+    if os.path.isdir(candidate):
+        return candidate
+    logging.warning(
+        "Could not find detached part path next to {} (looked for {})",
+        active_path,
+        candidate,
+    )
+    return None
 
 
 def _check_keys_exist(s3_client: Boto3Client, bucket: str, keys: Set[str]) -> Set[str]:
@@ -645,19 +744,4 @@ def detach_partition(ctx: Context, table_partition: TablePartition) -> bool:
         detach_query,
         timeout=ATTACH_DETTACH_TIMEOUT,
         retries=ATTACH_DETACH_QUERY_RETRY,
-    )
-
-
-def attach_partition(ctx: Context, table_partition: TablePartition) -> bool:
-    """
-    Run ATTACH the partition.
-    """
-
-    attach_query = f"ALTER TABLE {table_partition.table} ATTACH PARTITION '{table_partition.partition}'"
-    # To avoid keeping detached partitions, perform the attach query with double attempts.
-    return query_with_retry(
-        ctx,
-        attach_query,
-        timeout=ATTACH_DETTACH_TIMEOUT,
-        retries=2 * ATTACH_DETACH_QUERY_RETRY,
     )

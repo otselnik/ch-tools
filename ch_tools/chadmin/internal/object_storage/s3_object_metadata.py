@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,3 +110,32 @@ class S3ObjectLocalMetaData:
         Whether key also contains object storage prefix or not.
         """
         return self._version_with_full_object_key(self.version)
+
+    def to_string(self) -> str:
+        """
+        Serialize the metadata back to the on-disk textual representation
+        used by ClickHouse object-storage disks.
+
+        Format (matches the parser above):
+
+            <version>
+            <object_count> <total_size>
+            <size> <key>
+            ...
+            <ref_counter>
+            <read_only>
+        """
+        lines = [str(self.version), f"{len(self.objects)} {self.total_size}"]
+        for obj in self.objects:
+            lines.append(f"{obj.size} {obj.key}")
+        lines.append(str(self.ref_counter))
+        lines.append("1" if self.read_only else "0")
+        # ClickHouse writes a trailing newline.
+        return "\n".join(lines) + "\n"
+
+    def to_file(self, path: Path) -> None:
+        """Atomically write the metadata representation to ``path``."""
+        tmp = path.with_suffix(path.suffix + ".chadmin-tmp")
+        with tmp.open("w", encoding="latin-1") as file:
+            file.write(self.to_string())
+        os.replace(tmp, path)
