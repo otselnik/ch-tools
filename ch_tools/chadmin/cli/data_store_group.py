@@ -500,6 +500,8 @@ def detect_broken_partitions(  # pylint: disable=too-many-locals,too-many-branch
             )
             recovery_results.append(result)
             restored = result.reattached
+            if restored:
+                repaired_partitions.add(table_partition)
 
         if not restored:
             if part["status"] == UNRECOVERABLE and detach:

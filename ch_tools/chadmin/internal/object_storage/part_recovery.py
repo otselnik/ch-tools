@@ -11,6 +11,7 @@ from click import Context
 from ch_tools.chadmin.internal.object_storage.checksums_recovery_via_local import (
     build_recovery_ddl,
     get_show_create_table,
+    is_projection_checksums,
     recover_checksums_via_local,
 )
 from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
@@ -281,10 +282,25 @@ def recover_part_files_locally(
     function only touches files inside ``part_path`` (which by then lives
     under ``…/detached/…``) and S3 objects.
     """
-    checksums_recovered_via_local: bool = False
-
     results: List[FileRecoveryResult] = []
+    restored_checksums: List[str] = []
+    if recovery_ctx.is_replicated and "checksums.txt" in missing_files:
+        result, restored_checksums = _recover_checksums_replicated(
+            filename="checksums.txt",
+            part_path=part_path,
+            missing_files=missing_files,
+            recovery_ctx=recovery_ctx,
+            ctx=ctx,
+            disk_name=disk_name,
+            disk_config=disk_config,
+            ch_version=ch_version,
+        )
+        results.append(result)
+
+    restored_checksums_set = set(restored_checksums)
     for filename in missing_files:
+        if filename == "checksums.txt" and recovery_ctx.is_replicated:
+            continue
         try:
             if filename == "checksums.txt" and not recovery_ctx.is_replicated:
                 # Plain MergeTree: unlink local metadata so CH regenerates
@@ -297,28 +313,12 @@ def recover_part_files_locally(
                 )
                 continue
 
-            if filename == "checksums.txt" and recovery_ctx.is_replicated:
-                # ReplicatedMergeTree: use clickhouse-local to regenerate.
-                result = _recover_checksums_replicated(
-                    filename=filename,
-                    part_path=part_path,
-                    recovery_ctx=recovery_ctx,
-                    ctx=ctx,
-                    disk_name=disk_name,
-                    disk_config=disk_config,
-                    ch_version=ch_version,
-                )
-                results.append(result)
-                if result.status == "regenerated":
-                    checksums_recovered_via_local = True
-                continue
-
-            if checksums_recovered_via_local and _is_projection_checksums(filename):
+            if filename in restored_checksums_set and is_projection_checksums(filename):
                 results.append(
                     FileRecoveryResult(
                         filename,
                         "regenerated",
-                        "covered by parent checksums.txt clickhouse-local run",
+                        "checksums.txt regenerated via clickhouse-local",
                     )
                 )
                 continue
@@ -356,53 +356,55 @@ def recover_part_files_locally(
     return results
 
 
-def _is_projection_checksums(filename: str) -> bool:
-    """Return True if *filename* is a ``checksums.txt`` inside a projection sub-dir."""
-    # Projection files look like ``<name>.proj/checksums.txt``.
-    return filename.endswith(".proj/checksums.txt") or (
-        "/" in filename and filename.rsplit("/", 1)[-1] == "checksums.txt"
-    )
-
-
 def _recover_checksums_replicated(
     *,
     filename: str,
     part_path: str,
+    missing_files: List[str],
     recovery_ctx: PartRecoveryContext,
     ctx: Optional[Context],
     disk_name: Optional[str],
     disk_config: Optional[dict],
     ch_version: Optional[str],
-) -> FileRecoveryResult:
+) -> Tuple[FileRecoveryResult, List[str]]:
     """Attempt to regenerate ``checksums.txt`` for a Replicated part via
     ``clickhouse-local``.  Returns a :class:`FileRecoveryResult`.
     """
     if ctx is None or disk_name is None or disk_config is None or ch_version is None:
-        return FileRecoveryResult(
-            filename,
-            "skipped",
-            "clickhouse-local recovery not available (missing ctx/disk_name/disk_config/ch_version)",
+        return (
+            FileRecoveryResult(
+                filename,
+                "skipped",
+                "clickhouse-local recovery not available (missing ctx/disk_name/disk_config/ch_version)",
+            ),
+            [],
         )
 
     raw_ddl = get_show_create_table(ctx, recovery_ctx.database, recovery_ctx.table)
     if raw_ddl is None:
-        return FileRecoveryResult(
-            filename,
-            "skipped",
-            f"SHOW CREATE TABLE failed for {recovery_ctx.quoted_table}",
+        return (
+            FileRecoveryResult(
+                filename,
+                "skipped",
+                f"SHOW CREATE TABLE failed for {recovery_ctx.quoted_table}",
+            ),
+            [],
         )
 
     try:
         recovery_ddl = build_recovery_ddl(raw_ddl, disk_name)
     except Exception as exc:
-        return FileRecoveryResult(
-            filename,
-            "failed",
-            f"build_recovery_ddl failed: {exc!r}",
+        return (
+            FileRecoveryResult(
+                filename,
+                "failed",
+                f"build_recovery_ddl failed: {exc!r}",
+            ),
+            [],
         )
 
     try:
-        recover_checksums_via_local(
+        restored_files = recover_checksums_via_local(
             detached_part_path=part_path,
             part_name=recovery_ctx.part_name,
             database=recovery_ctx.database,
@@ -411,16 +413,23 @@ def _recover_checksums_replicated(
             disk_config=disk_config,
             create_table_ddl=recovery_ddl,
             ch_version=ch_version,
+            missing_files=missing_files,
         )
     except Exception as exc:
-        return FileRecoveryResult(
-            filename,
-            "failed",
-            f"clickhouse-local run failed: {exc!r}",
+        return (
+            FileRecoveryResult(
+                filename,
+                "failed",
+                f"clickhouse-local run failed: {exc!r}",
+            ),
+            [],
         )
 
-    return FileRecoveryResult(
-        filename,
-        "regenerated",
-        "checksums.txt regenerated via clickhouse-local (covers projection parts)",
+    return (
+        FileRecoveryResult(
+            filename,
+            "regenerated",
+            "checksums.txt regenerated via clickhouse-local",
+        ),
+        restored_files,
     )
