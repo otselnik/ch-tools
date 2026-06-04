@@ -89,6 +89,187 @@ Feature: chadmin data-store commands
       deleted: 'Yes'
     """
 
+  @require_version_23.3
+  Scenario: Detect broken object-storage part by missing structural file
+    When we execute queries on clickhouse01
+    """
+    SYSTEM STOP MERGES;
+
+    DROP DATABASE IF EXISTS test_db;
+    CREATE DATABASE test_db;
+    CREATE TABLE test_db.recoverable_plain (a UInt32, b UInt32)
+    ENGINE=MergeTree() ORDER BY a PARTITION BY b
+    SETTINGS storage_policy='object_storage';
+    INSERT INTO test_db.recoverable_plain SELECT number, number FROM numbers(3);
+    """
+    And we remove s3 objects for part files on clickhouse01
+    """
+    test_db:
+      recoverable_plain:
+        '0': ['columns.txt']
+    """
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions
+    """
+    Then we get response contains
+    """
+    - table: '`test_db`.`recoverable_plain`'
+      partition: '0'
+    """
+
+  @require_version_23.3
+  Scenario: Restore recoverable object-storage MergeTree part
+    When we execute queries on clickhouse01
+    """
+    SYSTEM STOP MERGES;
+
+    DROP DATABASE IF EXISTS test_db;
+    CREATE DATABASE test_db;
+    CREATE TABLE test_db.recoverable_plain (a UInt32, b UInt32)
+    ENGINE=MergeTree() ORDER BY a PARTITION BY b
+    SETTINGS storage_policy='object_storage';
+    INSERT INTO test_db.recoverable_plain SELECT number, number FROM numbers(3);
+    """
+    And we remove s3 objects for part files on clickhouse01
+    """
+    test_db:
+      recoverable_plain:
+        '0': ['columns.txt']
+    """
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions --restore-recoverable
+    """
+    Then we get response contains
+    """
+    - table: '`test_db`.`recoverable_plain`'
+      partition: '0'
+    """
+    When we execute query on clickhouse01
+    """
+    SELECT sum(a), sum(b) FROM test_db.recoverable_plain
+    """
+    Then we get response
+    """
+    3	3
+    """
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions
+    """
+    Then we get response contains
+    """
+    []
+    """
+
+  @require_version_23.3
+  Scenario: Restore ReplicatedMergeTree checksums via clickhouse-local
+    When we execute queries on clickhouse01
+    """
+    SYSTEM STOP MERGES;
+
+    DROP DATABASE IF EXISTS test_db;
+    CREATE DATABASE test_db;
+    CREATE TABLE test_db.replicated_checksums (a UInt32, b UInt32)
+    ENGINE=ReplicatedMergeTree('/clickhouse/test_db/replicated_checksums', '{replica}') ORDER BY a PARTITION BY b
+    SETTINGS storage_policy='object_storage';
+    INSERT INTO test_db.replicated_checksums SELECT number, number FROM numbers(3);
+    """
+    And we remove s3 objects for part files on clickhouse01
+    """
+    test_db:
+      replicated_checksums:
+        '0': ['checksums.txt']
+    """
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions --restore-recoverable
+    """
+    Then we get response contains
+    """
+    - table: '`test_db`.`replicated_checksums`'
+      partition: '0'
+    """
+    When we execute query on clickhouse01
+    """
+    SELECT sum(a), sum(b) FROM test_db.replicated_checksums
+    """
+    Then we get response
+    """
+    3	3
+    """
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions
+    """
+    Then we get response contains
+    """
+    []
+    """
+
+  @require_version_23.3
+  Scenario: Detach unrecoverable object-storage partition while restoring recoverable partitions
+    When we execute queries on clickhouse01
+    """
+    SYSTEM STOP MERGES;
+
+    DROP DATABASE IF EXISTS test_db;
+    CREATE DATABASE test_db;
+    CREATE TABLE test_db.mixed_recovery (a UInt32, b UInt32)
+    ENGINE=MergeTree() ORDER BY a PARTITION BY b
+    SETTINGS storage_policy='object_storage', min_bytes_for_wide_part=0;
+    INSERT INTO test_db.mixed_recovery VALUES (0, 0);
+    INSERT INTO test_db.mixed_recovery VALUES (1, 1);
+    CREATE TABLE test_db.unrecoverable_part (a UInt32, b UInt32)
+    ENGINE=MergeTree() ORDER BY a PARTITION BY b
+    SETTINGS storage_policy='object_storage', min_bytes_for_wide_part=0;
+    INSERT INTO test_db.unrecoverable_part VALUES (1, 1);
+    """
+    And we remove s3 objects for part files on clickhouse01
+    """
+    test_db:
+      mixed_recovery:
+        '0': ['checksums.txt']
+      unrecoverable_part:
+        '1': ['a.bin']
+    """
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions --restore-recoverable --detach
+    """
+    Then we get response contains
+    """
+    - table: '`test_db`.`mixed_recovery`'
+      partition: '0'
+    - table: '`test_db`.`unrecoverable_part`'
+      partition: '1'
+    """
+    When we execute query on clickhouse01
+    """
+    SELECT groupArray((a, b)) FROM test_db.mixed_recovery
+    """
+    Then we get response
+    """
+    [(0,0),(1,1)]
+    """
+    When we execute query on clickhouse01
+    """
+    SELECT count() FROM test_db.unrecoverable_part
+    """
+    Then we get response
+    """
+    0
+    """
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions
+    """
+    Then we get response contains
+    """
+    []
+    """
+
   # TODO: enable after detach partition fix
   @skip
   Scenario Outline: Reattach partitions with broken parts from zero copy

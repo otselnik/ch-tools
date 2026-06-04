@@ -149,8 +149,10 @@ def copy_recovered_checksums_back(
 
 def is_projection_checksums(filename: str) -> bool:
     parts = Path(filename).parts
-    return len(parts) >= 2 and parts[-1] == _CHECKSUMS_FILENAME and any(
-        part.endswith(".proj") for part in parts[:-1]
+    return (
+        len(parts) >= 2
+        and parts[-1] == _CHECKSUMS_FILENAME
+        and any(part.endswith(".proj") for part in parts[:-1])
     )
 
 
@@ -327,9 +329,11 @@ def _find_keyword(sql: str, keyword: str, start: int) -> int:
             end = sql.find("*/", idx + 2)
             idx = len(sql) if end < 0 else end + 2
             continue
-        if sql[idx : idx + len(keyword)].upper() == keyword_upper and _is_boundary(
-            sql, idx - 1
-        ) and _is_boundary(sql, idx + len(keyword)):
+        if (
+            sql[idx : idx + len(keyword)].upper() == keyword_upper
+            and _is_boundary(sql, idx - 1)
+            and _is_boundary(sql, idx + len(keyword))
+        ):
             return idx
         idx += 1
     return -1
