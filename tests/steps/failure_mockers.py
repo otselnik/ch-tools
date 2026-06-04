@@ -75,12 +75,17 @@ def _get_part_file_s3_key(
     file_local_path = os.path.join(part_local_path, filename)
     container = get_container(context, node)
     result = container.exec_run(
-        ["bash", "-c", f"sed -n '3p' {file_local_path} | awk '{{print $2}}'"],
+        ["bash", "-c", f"sed -n '1p;3p' {file_local_path}"],
         user="root",
     )
     assert_that(result.exit_code, equal_to(0))
-    key = result.output.decode().strip()
-    assert key, f"S3 object metadata for {file_local_path} was not found"
+    lines = result.output.decode().splitlines()
+    assert len(lines) == 2, f"S3 object metadata for {file_local_path} was not found"
+
+    version = int(lines[0])
+    key = lines[1].split(maxsplit=1)[1]
+    if version < 5:
+        key = f"data/cluster_id/shard_1/{key}"
     return key
 
 
