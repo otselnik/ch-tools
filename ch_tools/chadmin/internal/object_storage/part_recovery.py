@@ -99,15 +99,11 @@ def get_part_recovery_context(
         "data"
     ][0]
 
-    tables_query = (
-        "SELECT engine, metadata_version FROM system.tables "
-        f"WHERE database = '{database}' AND name = '{table}' LIMIT 1"
-    )
-    tables_res = execute_query(ctx, tables_query, format_=OutputFormat.JSONCompact)
-    if not tables_res.get("data"):
+    table_info = _get_table_engine_and_metadata_version(ctx, database, table)
+    if table_info is None:
         logging.warning("Table {}.{} not found in system.tables", database, table)
         return None
-    engine, metadata_version = tables_res["data"][0]
+    engine, metadata_version = table_info
 
     columns_query = (
         "SELECT name, type FROM system.columns "
@@ -130,6 +126,38 @@ def get_part_recovery_context(
         is_replicated="Replicated" in (engine or ""),
         columns=columns,
     )
+
+
+def _get_table_engine_and_metadata_version(
+    ctx: Context, database: str, table: str
+) -> Optional[Tuple[Optional[str], int]]:
+    tables_query = (
+        "SELECT engine, metadata_version FROM system.tables "
+        f"WHERE database = '{database}' AND name = '{table}' LIMIT 1"
+    )
+    try:
+        tables_res = execute_query(ctx, tables_query, format_=OutputFormat.JSONCompact)
+    except Exception:
+        # ClickHouse 23.3 does not have system.tables.metadata_version.
+        tables_res = _get_table_engine_without_metadata_version(ctx, database, table)
+
+    if not tables_res.get("data"):
+        return None
+
+    row = tables_res["data"][0]
+    engine = row[0]
+    metadata_version = row[1] if len(row) > 1 and row[1] is not None else 0
+    return engine, int(metadata_version)
+
+
+def _get_table_engine_without_metadata_version(
+    ctx: Context, database: str, table: str
+) -> dict:
+    tables_query = (
+        "SELECT engine FROM system.tables "
+        f"WHERE database = '{database}' AND name = '{table}' LIMIT 1"
+    )
+    return execute_query(ctx, tables_query, format_=OutputFormat.JSONCompact)
 
 
 # ---------------------------------------------------------------------------
