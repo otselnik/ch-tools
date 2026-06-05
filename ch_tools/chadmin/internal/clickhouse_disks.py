@@ -1,5 +1,5 @@
 import subprocess
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import xmltodict
 
@@ -17,9 +17,18 @@ S3_METADATA_STORE_PATH = S3_PATH + "/store"
 OBJECT_STORAGE_DISK_TYPES = ["s3", "object_storage", "ObjectStorage"]
 
 
-def make_ch_disks_config(disk: str) -> str:
-    disk_config = ClickhouseConfig.load().storage_configuration.get_disk_config(disk)
-    disk_config_path = f"/tmp/chadmin-ch-disks-{disk}.xml"
+def make_ch_disks_config(
+    disk: str,
+    output_path: Optional[str] = None,
+    disk_config: Optional[Dict] = None,
+) -> str:
+    if disk_config is None:
+        disk_config = ClickhouseConfig.load().storage_configuration.get_disk_config(
+            disk
+        )
+    if output_path is None:
+        output_path = f"/tmp/chadmin-ch-disks-{disk}.xml"
+    disk_config_path = output_path
     logging.info("Create a conf for {} disk: {}", disk, disk_config_path)
     with open(disk_config_path, "w", encoding="utf-8") as f:
         xmltodict.unparse(

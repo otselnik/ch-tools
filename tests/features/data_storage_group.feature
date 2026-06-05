@@ -247,7 +247,7 @@ Feature: chadmin data-store commands
     """
     When we execute query on clickhouse01
     """
-    SELECT groupArray((a, b)) FROM test_db.mixed_recovery
+    SELECT arraySort(groupArray((a, b))) FROM test_db.mixed_recovery
     """
     Then we get response
     """

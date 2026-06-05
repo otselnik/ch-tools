@@ -1,8 +1,9 @@
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+
+from ch_tools.common.utils import atomic_write_file
 
 MAX_METADATA_FILE_SIZE = 10 * 1024
 VERSION_FULL_OBJECT_KEY = 5
@@ -135,7 +136,4 @@ class S3ObjectLocalMetaData:
 
     def to_file(self, path: Path) -> None:
         """Atomically write the metadata representation to ``path``."""
-        tmp = path.with_suffix(path.suffix + ".chadmin-tmp")
-        with tmp.open("w", encoding="latin-1") as file:
-            file.write(self.to_string())
-        os.replace(tmp, path)
+        atomic_write_file(path, self.to_string().encode("latin-1"))

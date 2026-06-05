@@ -7,6 +7,16 @@ from typing import Any, Dict, List, Union
 from click import Context
 
 
+def atomic_write_file(path: Path, content: bytes) -> None:
+    """
+    Atomically write ``content`` to ``path`` using a temporary file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".chadmin-tmp")
+    tmp.write_bytes(content)
+    os.replace(tmp, path)
+
+
 def version_ge(version1: str, version2: str) -> bool:
     """
     Return True if version1 is greater or equal than version2.

@@ -6,11 +6,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from boto3 import client as Boto3Client
-from click import Context
+from click import ClickException, Context
 
 from ch_tools.chadmin.internal.object_storage.checksums_recovery_via_local import (
     build_recovery_ddl,
-    get_show_create_table,
     is_projection_checksums,
     recover_checksums_via_local,
 )
@@ -24,6 +23,7 @@ from ch_tools.chadmin.internal.object_storage.structural_files import (
     generate_default_compression_codec,
     generate_metadata_version,
 )
+from ch_tools.chadmin.internal.table_schema_diff import get_schema_from_clickhouse
 from ch_tools.chadmin.internal.utils import execute_query
 from ch_tools.common import logging
 from ch_tools.common.clickhouse.client import OutputFormat
@@ -408,7 +408,18 @@ def _recover_checksums_replicated(
             [],
         )
 
-    raw_ddl = get_show_create_table(ctx, recovery_ctx.database, recovery_ctx.table)
+    try:
+        raw_ddl = get_schema_from_clickhouse(
+            ctx, recovery_ctx.database, recovery_ctx.table
+        )
+    except ClickException as exc:
+        raw_ddl = None
+        logging.warning(
+            "SHOW CREATE TABLE `{}`.`{}` failed: {}",
+            recovery_ctx.database,
+            recovery_ctx.table,
+            exc,
+        )
     if raw_ddl is None:
         return (
             FileRecoveryResult(

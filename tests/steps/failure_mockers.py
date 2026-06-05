@@ -12,6 +12,10 @@ from modules.docker import get_container
 from modules.steps import get_step_data
 from modules.typing import ContextT
 
+from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
+    S3ObjectLocalMetaData,
+)
+
 
 @when("we remove key from s3 for partitions database {database} on {node:w}")
 def step_remove_keys_from_s3_for_partition(
@@ -75,16 +79,17 @@ def _get_part_file_s3_key(
     file_local_path = os.path.join(part_local_path, filename)
     container = get_container(context, node)
     result = container.exec_run(
-        ["bash", "-c", f"sed -n '1p;3p' {file_local_path}"],
+        ["cat", file_local_path],
         user="root",
     )
     assert_that(result.exit_code, equal_to(0))
-    lines = result.output.decode().splitlines()
-    assert len(lines) == 2, f"S3 object metadata for {file_local_path} was not found"
 
-    version = int(lines[0])
-    key = lines[1].split(maxsplit=1)[1]
-    if version < 5:
+    metadata = S3ObjectLocalMetaData.from_string(result.output.decode())
+    assert metadata.objects, f"S3 object metadata for {file_local_path} was not found"
+
+    obj = metadata.objects[0]
+    key = obj.key
+    if not obj.key_is_full:
         key = f"data/cluster_id/shard_1/{key}"
     return key
 

@@ -1,19 +1,15 @@
 from __future__ import annotations
 
-import os
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import List, Sequence
 
-import xmltodict
-
-from ch_tools.chadmin.internal.utils import execute_query
+from ch_tools.chadmin.internal.clickhouse_disks import make_ch_disks_config
 from ch_tools.common import logging
-
-if TYPE_CHECKING:
-    from click import Context
+from ch_tools.common.utils import atomic_write_file
 
 CLICKHOUSE_LOCAL_BIN = "clickhouse-local"
 _SUBPROCESS_TIMEOUT = 600
@@ -66,7 +62,11 @@ def recover_checksums_via_local(
             part_name=part_name,
             missing_checksums=requested_checksums,
         )
-        disk_config_path = _write_disk_config(tmp_path, disk_name, disk_config)
+        disk_config_path = make_ch_disks_config(
+            disk_name,
+            output_path=str(tmp_path / f"disk-{disk_name}.xml"),
+            disk_config=disk_config,
+        )
         sql = _build_recovery_sql(
             create_table_ddl=create_table_ddl,
             part_name=part_name,
@@ -157,99 +157,62 @@ def is_projection_checksums(filename: str) -> bool:
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destination.with_name(destination.name + ".chadmin-tmp")
-    tmp.write_bytes(source.read_bytes())
-    os.replace(tmp, destination)
+    atomic_write_file(destination, source.read_bytes())
 
 
 def _replace_create_table_name(ddl: str, table_name: str) -> str:
-    idx = _find_keyword(ddl, "CREATE", 0)
-    if idx < 0:
-        raise ValueError("CREATE keyword not found")
-    idx += len("CREATE")
-    idx = _skip_ws(ddl, idx)
-    if _keyword_at(ddl, idx, "OR"):
-        idx = _skip_ws(ddl, idx + len("OR"))
-        if not _keyword_at(ddl, idx, "REPLACE"):
-            raise ValueError("Expected REPLACE after CREATE OR")
-        idx = _skip_ws(ddl, idx + len("REPLACE"))
-    if not _keyword_at(ddl, idx, "TABLE"):
-        raise ValueError("TABLE keyword not found after CREATE")
-    idx = _skip_ws(ddl, idx + len("TABLE"))
-    if _keyword_at(ddl, idx, "IF"):
-        idx = _skip_ws(ddl, idx + len("IF"))
-        if not _keyword_at(ddl, idx, "NOT"):
-            raise ValueError("Expected NOT in IF NOT EXISTS")
-        idx = _skip_ws(ddl, idx + len("NOT"))
-        if not _keyword_at(ddl, idx, "EXISTS"):
-            raise ValueError("Expected EXISTS in IF NOT EXISTS")
-        idx = _skip_ws(ddl, idx + len("EXISTS"))
-
-    start, end = _read_table_identifier(ddl, idx)
-    return ddl[:start] + table_name + ddl[end:]
+    return re.sub(
+        r"^(CREATE\s+TABLE\s+)(?:\`?\w+\`?\.)?\`?\w+\`?",
+        rf"\1{table_name}",
+        ddl,
+        count=1,
+        flags=re.IGNORECASE,
+    )
 
 
 def _rewrite_replicated_engine(ddl: str) -> str:
-    engine_idx = _find_keyword(ddl, "ENGINE", 0)
-    if engine_idx < 0:
-        raise ValueError("ENGINE clause not found")
-    idx = _skip_ws(ddl, engine_idx + len("ENGINE"))
-    if idx < len(ddl) and ddl[idx] == "=":
-        idx = _skip_ws(ddl, idx + 1)
+    m = re.search(
+        r"ENGINE\s*=\s*(Replicated\w*MergeTree)\s*"
+        r"\(\s*'[^']*'\s*,\s*'[^']*'\s*(?:,\s*(.*?))?\s*\)",
+        ddl,
+        re.IGNORECASE,
+    )
+    if not m:
+        raise ValueError("ENGINE clause with Replicated*MergeTree not found")
 
-    name_start, name_end = _read_bare_identifier(ddl, idx)
-    engine_name = ddl[name_start:name_end]
+    engine_name = m.group(1)
     if engine_name not in _ENGINE_MAP:
         raise ValueError(f"Unsupported replicated engine: {engine_name!r}")
 
-    idx = _skip_ws(ddl, name_end)
-    args: List[str] = []
-    call_end = name_end
-    if idx < len(ddl) and ddl[idx] == "(":
-        args_text, call_end = _read_parenthesized(ddl, idx)
-        args = _split_top_level_args(args_text)
-
-    if len(args) < 2:
-        raise ValueError(f"Replicated engine {engine_name} must have at least 2 args")
     plain_engine = _ENGINE_MAP[engine_name]
-    plain_args = args[2:]
-    replacement = f"{plain_engine}({', '.join(plain_args)})"
-    return ddl[:name_start] + replacement + ddl[call_end:]
+    rest = m.group(2) or ""
+    if rest:
+        replacement = f"ENGINE = {plain_engine}({rest})"
+    else:
+        replacement = f"ENGINE = {plain_engine}"
+    return ddl[: m.start()] + replacement + ddl[m.end() :]
 
 
 def _set_disk_setting(ddl: str, disk_name: str) -> str:
-    settings_idx = _find_keyword(ddl, "SETTINGS", 0)
-    if settings_idx < 0:
+    si = ddl.lower().rfind("settings")
+    if si < 0:
         return f"{ddl.rstrip()}\nSETTINGS disk = '{disk_name}'"
 
-    disk_idx = _find_keyword(ddl, "disk", settings_idx + len("SETTINGS"))
-    if disk_idx >= 0:
-        idx = _skip_ws(ddl, disk_idx + len("disk"))
-        if idx < len(ddl) and ddl[idx] == "=":
-            value_start = _skip_ws(ddl, idx + 1)
-            value_end = _read_setting_value_end(ddl, value_start)
-            return ddl[:disk_idx] + f"disk = '{disk_name}'" + ddl[value_end:]
-
-    insert_at = settings_idx + len("SETTINGS")
-    return ddl[:insert_at] + f" disk = '{disk_name}'," + ddl[insert_at:]
-
-
-def _write_disk_config(tmp_path: Path, disk_name: str, disk_config: dict) -> Path:
-    config_path = tmp_path / f"disk-{disk_name}.xml"
-    with config_path.open("w", encoding="utf-8") as fh:
-        xmltodict.unparse(
-            {
-                "clickhouse": {
-                    "storage_configuration": {
-                        "disks": {disk_name: disk_config},
-                    }
-                }
-            },
-            fh,
-            pretty=True,
+    prefix = ddl[:si]
+    settings_text = ddl[si:]
+    m = re.search(r"\bdisk\s*=\s*'[^']*'", settings_text, re.IGNORECASE)
+    if m:
+        settings_text = (
+            settings_text[: m.start()]
+            + f"disk = '{disk_name}'"
+            + settings_text[m.end() :]
         )
-    return config_path
+    else:
+        settings_text = (
+            f"SETTINGS disk = '{disk_name}'," + settings_text[len("SETTINGS") :]
+        )
+
+    return prefix + settings_text
 
 
 def _build_recovery_sql(
@@ -308,195 +271,3 @@ def _run_clickhouse_local(
             f"stderr: {stderr}\n"
             f"sql: {sql}"
         )
-
-
-def _find_keyword(sql: str, keyword: str, start: int) -> int:
-    keyword_upper = keyword.upper()
-    idx = start
-    while idx < len(sql):
-        char = sql[idx]
-        if char == "'":
-            idx = _skip_single_quoted(sql, idx)
-            continue
-        if char == "`":
-            idx = _skip_back_quoted(sql, idx)
-            continue
-        if sql.startswith("--", idx):
-            newline = sql.find("\n", idx + 2)
-            idx = len(sql) if newline < 0 else newline + 1
-            continue
-        if sql.startswith("/*", idx):
-            end = sql.find("*/", idx + 2)
-            idx = len(sql) if end < 0 else end + 2
-            continue
-        if (
-            sql[idx : idx + len(keyword)].upper() == keyword_upper
-            and _is_boundary(sql, idx - 1)
-            and _is_boundary(sql, idx + len(keyword))
-        ):
-            return idx
-        idx += 1
-    return -1
-
-
-def _keyword_at(sql: str, idx: int, keyword: str) -> bool:
-    return (
-        sql[idx : idx + len(keyword)].upper() == keyword.upper()
-        and _is_boundary(sql, idx - 1)
-        and _is_boundary(sql, idx + len(keyword))
-    )
-
-
-def _is_boundary(sql: str, idx: int) -> bool:
-    if idx < 0 or idx >= len(sql):
-        return True
-    return not (sql[idx].isalnum() or sql[idx] == "_")
-
-
-def _skip_ws(sql: str, idx: int) -> int:
-    while idx < len(sql) and sql[idx].isspace():
-        idx += 1
-    return idx
-
-
-def _read_table_identifier(sql: str, idx: int) -> Tuple[int, int]:
-    start = idx
-    _, idx = _read_identifier(sql, idx)
-    idx = _skip_ws(sql, idx)
-    if idx < len(sql) and sql[idx] == ".":
-        idx = _skip_ws(sql, idx + 1)
-        _, idx = _read_identifier(sql, idx)
-    return start, idx
-
-
-def _read_identifier(sql: str, idx: int) -> Tuple[int, int]:
-    if idx < len(sql) and sql[idx] == "`":
-        end = _skip_back_quoted(sql, idx)
-        return idx, end
-    return _read_bare_identifier(sql, idx)
-
-
-def _read_bare_identifier(sql: str, idx: int) -> Tuple[int, int]:
-    if idx >= len(sql) or not (sql[idx].isalpha() or sql[idx] == "_"):
-        raise ValueError(f"Expected identifier at position {idx}")
-    start = idx
-    idx += 1
-    while idx < len(sql) and (sql[idx].isalnum() or sql[idx] == "_"):
-        idx += 1
-    return start, idx
-
-
-def _read_parenthesized(sql: str, idx: int) -> Tuple[str, int]:
-    if idx >= len(sql) or sql[idx] != "(":
-        raise ValueError(f"Expected '(' at position {idx}")
-    start = idx + 1
-    depth = 1
-    idx += 1
-    while idx < len(sql):
-        char = sql[idx]
-        if char == "'":
-            idx = _skip_single_quoted(sql, idx)
-            continue
-        if char == "`":
-            idx = _skip_back_quoted(sql, idx)
-            continue
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return sql[start:idx], idx + 1
-        idx += 1
-    raise ValueError("Unclosed parenthesized expression")
-
-
-def _split_top_level_args(args_text: str) -> List[str]:
-    args: List[str] = []
-    start = 0
-    idx = 0
-    depth = 0
-    while idx < len(args_text):
-        char = args_text[idx]
-        if char == "'":
-            idx = _skip_single_quoted(args_text, idx)
-            continue
-        if char == "`":
-            idx = _skip_back_quoted(args_text, idx)
-            continue
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        elif char == "," and depth == 0:
-            args.append(args_text[start:idx].strip())
-            start = idx + 1
-        idx += 1
-    tail = args_text[start:].strip()
-    if tail:
-        args.append(tail)
-    return args
-
-
-def _read_setting_value_end(sql: str, idx: int) -> int:
-    depth = 0
-    while idx < len(sql):
-        char = sql[idx]
-        if char == "'":
-            idx = _skip_single_quoted(sql, idx)
-            continue
-        if char == "`":
-            idx = _skip_back_quoted(sql, idx)
-            continue
-        if char == "(":
-            depth += 1
-        elif char == ")" and depth > 0:
-            depth -= 1
-        elif char == "," and depth == 0:
-            return idx
-        idx += 1
-    return idx
-
-
-def _skip_single_quoted(sql: str, idx: int) -> int:
-    idx += 1
-    while idx < len(sql):
-        if sql[idx] == "\\":
-            idx += 2
-            continue
-        if sql[idx] == "'":
-            if idx + 1 < len(sql) and sql[idx + 1] == "'":
-                idx += 2
-                continue
-            return idx + 1
-        idx += 1
-    raise ValueError("Unclosed string literal")
-
-
-def _skip_back_quoted(sql: str, idx: int) -> int:
-    idx += 1
-    while idx < len(sql):
-        if sql[idx] == "\\":
-            idx += 2
-            continue
-        if sql[idx] == "`":
-            return idx + 1
-        idx += 1
-    raise ValueError("Unclosed quoted identifier")
-
-
-def get_show_create_table(
-    ctx: "Context",
-    database: str,
-    table: str,
-) -> Optional[str]:
-    query = f"SHOW CREATE TABLE `{database}`.`{table}`"
-    try:
-        result = execute_query(ctx, query, format_="TSVRaw")
-        if isinstance(result, str):
-            return result.strip() or None
-        return None
-    except Exception as exc:
-        logging.warning(
-            "SHOW CREATE TABLE `{}`.`{}` failed: {!r}", database, table, exc
-        )
-        return None
