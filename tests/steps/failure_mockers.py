@@ -51,9 +51,15 @@ def step_remove_s3_object_for_active_part_file(
         f"WHERE database='{database}' AND table='{table}' AND active "
         "ORDER BY name LIMIT 1"
     )
-    part_path = execute_query(context, node, part_path_query, format_="JSONCompact")[
+    part_data = execute_query(context, node, part_path_query, format_="JSONCompact")[
         "data"
-    ][0][0]
+    ]
+    if not part_data:
+        raise AssertionError(
+            f"No active part found for table {database}.{table} on node {node} "
+            f"when trying to remove S3 object for file {filename}"
+        )
+    part_path = part_data[0][0]
 
     object_key = get_s3_object_key_for_part_file(context, node, part_path, filename)
 
@@ -71,9 +77,15 @@ def get_s3_object_key_for_part_file(
         f"AND startsWith(concat(path, local_path), '{os.path.join(part_path, filename)}') "
         "LIMIT 1"
     )
-    return execute_query(context, node, object_key_query, format_="JSONCompact")[
-        "data"
-    ][0][0]
+    object_key_data = execute_query(
+        context, node, object_key_query, format_="JSONCompact"
+    )["data"]
+    if not object_key_data:
+        raise AssertionError(
+            f"No remote object path found for active part file {filename} "
+            f"at {part_path} on node {node}"
+        )
+    return object_key_data[0][0]
 
 
 @when("we move parts as broken_on_start for table {database}.{table} on {node:w}")

@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,7 +115,4 @@ class S3ObjectLocalMetaData:
 def get_object_storage_key(prefix: str, s3_object: S3ObjectLocalInfo) -> str:
     if s3_object.key_is_full:
         return s3_object.key
-    key = s3_object.key.lstrip("/")
-    if not prefix:
-        return key
-    return f"{prefix.rstrip('/')}/{key}"
+    return os.path.join(prefix, s3_object.key)
