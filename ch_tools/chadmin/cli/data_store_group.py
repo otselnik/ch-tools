@@ -1,11 +1,9 @@
 import os
 import shutil
 import subprocess
-from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import boto3
-from boto3 import client as Boto3Client
 from click import Context, group, option, pass_context
 from cloup.constraints import AcceptAtMost, constraint
 
@@ -18,26 +16,19 @@ from ch_tools.chadmin.internal.clickhouse_disks import (
     make_ch_disks_config,
     remove_from_ch_disk,
 )
-from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
-    S3ObjectLocalInfo,
-    S3ObjectLocalMetaData,
+from ch_tools.chadmin.internal.object_storage.broken_partitions_recovery import (
+    find_broken_parts,
+    make_partition_report,
+    repair_broken_partition,
+    restore_recoverable_broken_partitions,
 )
 from ch_tools.chadmin.internal.system import get_version
-from ch_tools.chadmin.internal.utils import execute_query, remove_from_disk
+from ch_tools.chadmin.internal.utils import remove_from_disk
 from ch_tools.common import logging
 from ch_tools.common.cli.formatting import print_response
-from ch_tools.common.clickhouse.client import OutputFormat
 from ch_tools.common.clickhouse.config import get_clickhouse_config
 from ch_tools.common.clickhouse.config.storage_configuration import S3DiskConfiguration
 from ch_tools.common.process_pool import WorkerTask, execute_tasks_in_parallel
-
-ATTACH_DETTACH_TIMEOUT = 5000
-ATTACH_DETACH_QUERY_RETRY = 10
-
-
-class TablePartition(NamedTuple):
-    table: str
-    partition: str
 
 
 @group("data-store", cls=Chadmin)
@@ -370,10 +361,21 @@ def collect_orphaned_sql_objects_recursive(
     default=False,
     help="Flag to detach broken partitions.",
 )
+@option(
+    "--restore-recoverable",
+    is_flag=True,
+    default=False,
+    help="Flag to restore safely recoverable missing S3 objects.",
+)
 @constraint(AcceptAtMost(1), ["detach", "reattach"])
+@constraint(AcceptAtMost(1), ["reattach", "restore_recoverable"])
 @pass_context
 def detect_broken_partitions(
-    ctx: Context, root_path: str, reattach: bool, detach: bool
+    ctx: Context,
+    root_path: str,
+    reattach: bool,
+    detach: bool,
+    restore_recoverable: bool,
 ) -> None:
     ch_config = get_clickhouse_config(ctx)
 
@@ -388,176 +390,55 @@ def detect_broken_partitions(
         aws_access_key_id=disk_conf.access_key_id,
         aws_secret_access_key=disk_conf.secret_access_key,
     )
-    repaired_partitions: Set[TablePartition] = set()
 
-    for path, _, files in os.walk(root_path):
-        objects: List[S3ObjectLocalInfo] = []
-        logging.debug(f"Checking files from: {path}")
-        for file in files:
-            try:
-                file_full_path = Path(os.path.join(path, file))
-                objects.extend(S3ObjectLocalMetaData.from_file(file_full_path).objects)
-            except Exception as e:
-                logging.error("Failed to perform extend objects: {!r}", e)
+    if restore_recoverable:
+        restore_report = restore_recoverable_broken_partitions(
+            ctx=ctx,
+            root_path=root_path,
+            s3_client=s3_client,
+            disk_conf=disk_conf,
+            detach_unrecoverable=detach,
+        )
+        print_response(ctx, restore_report, default_format="table")
+        return
 
-        for s3_object in objects:
-            if s3_object.key_is_full:
-                object_storage_key = s3_object.key
-            else:
-                object_storage_key = os.path.join(disk_conf.prefix, s3_object.key)
+    broken_parts = find_broken_parts(ctx, root_path, s3_client, disk_conf)
+    repaired_partitions = []
+    seen_partitions = set()
 
-            if check_key_in_object_storage(
-                s3_client, disk_conf.bucket_name, object_storage_key
-            ):
-                continue
+    for broken_part in broken_parts:
+        part_info = broken_part.info
+        partition_key = (
+            part_info.database,
+            part_info.table,
+            part_info.partition_id,
+        )
+        if partition_key in seen_partitions:
+            logging.debug(
+                "Partition {} for table {} was already repaired. Skip.",
+                part_info.partition_id,
+                part_info.table_id,
+            )
+            continue
 
-            logging.debug("Not found key {}", object_storage_key)
+        seen_partitions.add(partition_key)
+        repaired_partitions.append(make_partition_report(part_info))
 
-            table_partition = get_partition_by_path(ctx, path)
+        logging.debug(
+            "Found the partition with missing blob in object storage: path={} table={} partition={}",
+            broken_part.path,
+            part_info.table_id,
+            part_info.partition_id,
+        )
+        if detach:
+            repair_broken_partition(ctx, part_info, attach=False)
+        elif reattach:
+            repair_broken_partition(ctx, part_info)
 
-            if table_partition is None:
-                logging.warning("Skip failed path {}.", path)
-                break
-
-            if table_partition not in repaired_partitions:
-                repaired_partitions.add(table_partition)
-
-                logging.debug(
-                    "Found the partition with missing blob in the object storage: path={} table={} partition={} ",
-                    path,
-                    table_partition.table,
-                    table_partition.partition,
-                )
-                if detach:
-                    try_repair_partition(ctx, table_partition, False)
-                elif reattach:
-                    try_repair_partition(ctx, table_partition)
-            else:
-                logging.debug(
-                    "Partition {} for table {} was already repared. Skip.",
-                    table_partition.partition,
-                    table_partition.table,
-                )
-
-            break
-
-    print_partitions(ctx, repaired_partitions)
+    repaired_partitions.sort(key=lambda item: (item["table"], item["partition"]))
+    print_response(ctx, repaired_partitions, default_format="table")
 
     logging.debug(
         "Found parts with missing s3 keys. Local paths of parts: {}",
-        repaired_partitions,
-    )
-
-
-def try_repair_partition(
-    ctx: Context, table_partition: TablePartition, attach: bool = True
-) -> None:
-    """
-    Try to repair broken partition with DETACH and optional ATTACH.
-    """
-    detach_partition(ctx, table_partition)
-
-    if attach:
-        attach_partition(ctx, table_partition)
-
-
-def check_key_in_object_storage(s3_client: Boto3Client, bucket: str, key: str) -> bool:
-    """
-    Check that object exists in s3 bucket with the specified key.
-    """
-    s3_resp = s3_client.list_objects_v2(
-        Bucket=bucket,
-        Prefix=key,
-    )
-    if "Contents" not in s3_resp:
-        return False
-    if len(s3_resp["Contents"]) != 1:
-        return False
-    res = s3_resp["Contents"][0]["Key"] == key
-    return res
-
-
-def get_partition_by_path(ctx: Context, path: str) -> Optional[TablePartition]:
-    """
-    Get partition from path
-    """
-    query_string = (
-        f"SELECT database, table, partition FROM system.parts WHERE path='{path}/'"
-    )
-    res = execute_query(ctx, query_string, format_=OutputFormat.JSONCompact)
-    if "data" not in res:
-        logging.warning("Not found data for part with path {}", path)
-        return None
-
-    if len(res["data"]) != 1 or len(res["data"][0]) != 3:
-        return None
-
-    table = f"`{res['data'][0][0]}`.`{res['data'][0][1]}`"
-    partition = res["data"][0][2]
-    return TablePartition(table, partition)
-
-
-def print_partitions(ctx: Context, repaired_partitions: Set[TablePartition]) -> None:
-    """
-    For each path of part match corresponding table and partition.
-    """
-
-    # It's not really necessary, just to make output stable for tests.
-    partitions_list: List[TablePartition] = list(repaired_partitions)
-    partitions_list.sort()
-
-    result = [
-        {"table": partition[0], "partition": partition[1]}
-        for partition in partitions_list
-    ]
-
-    print_response(ctx, result, default_format="table")
-
-
-def query_with_retry(ctx: Context, query: str, timeout: int, retries: int) -> bool:
-    """
-    Execute clickhouse query with given number of retries.
-    """
-    logging.debug("Execute query: {}", query)
-    for retry in range(retries):
-        try:
-            res = execute_query(ctx, query, timeout=timeout)
-            if res == "":
-                break
-        except Exception as e:
-            if retry + 1 == retries:
-                logging.warning("Query {} failed  with:  {!r}\n", query, e)
-                return False
-            continue
-
-    logging.info("Query {} finished successfully", query)
-    return True
-
-
-def detach_partition(ctx: Context, table_partition: TablePartition) -> bool:
-    """
-    Run DETACH the partition.
-    """
-
-    detach_query = f"ALTER TABLE {table_partition.table} DETACH PARTITION '{table_partition.partition}'"
-    return query_with_retry(
-        ctx,
-        detach_query,
-        timeout=ATTACH_DETTACH_TIMEOUT,
-        retries=ATTACH_DETACH_QUERY_RETRY,
-    )
-
-
-def attach_partition(ctx: Context, table_partition: TablePartition) -> bool:
-    """
-    Run ATTACH the partition.
-    """
-
-    attach_query = f"ALTER TABLE {table_partition.table} ATTACH PARTITION '{table_partition.partition}'"
-    # To avoid keeping detached partitions, perform the attach query with double attempts.
-    return query_with_retry(
-        ctx,
-        attach_query,
-        timeout=ATTACH_DETTACH_TIMEOUT,
-        retries=2 * ATTACH_DETACH_QUERY_RETRY,
+        [broken_part.path for broken_part in broken_parts],
     )
