@@ -41,6 +41,51 @@ def step_remove_keys_from_s3_for_partition(
         s3_client.delete_data(key)
 
 
+@when(
+    "we remove S3 blobs for file {filename} from detached part "
+    "{database}.{table} on {node:w}"
+)
+def step_remove_file_blobs_from_detached_part(
+    context: ContextT,
+    filename: str,
+    database: str,
+    table: str,
+    node: str,
+) -> None:
+    detached_parts = execute_query(
+        context,
+        node,
+        (
+            "SELECT path FROM system.detached_parts "
+            f"WHERE database='{database}' AND table='{table}'"
+        ),
+        format_="JSONCompact",
+    )["data"]
+    assert len(detached_parts) == 1, (
+        f"Expected one detached part for {database}.{table}, "
+        f"found {len(detached_parts)}"
+    )
+
+    logical_path = os.path.join(detached_parts[0][0], filename)
+    escaped_path = logical_path.replace("\\", "\\\\").replace("'", "\\'")
+    remote_paths = execute_query(
+        context,
+        node,
+        (
+            "SELECT remote_path FROM system.remote_data_paths "
+            "WHERE disk_name='object_storage' "
+            f"AND startsWith(concat(path, local_path), '{escaped_path}')"
+        ),
+        format_="JSONCompact",
+    )["data"]
+    assert remote_paths, f"No S3 blobs found for {logical_path}"
+
+    s3_client = s3.S3Client(context)
+    for remote_path in {row[0] for row in remote_paths}:
+        s3_client.delete_data(remote_path)
+        assert not s3_client.path_exists(remote_path)
+
+
 @when("we move parts as broken_on_start for table {database}.{table} on {node:w}")
 def step_mark_parts_as_broken_on_start(
     context: ContextT, database: str, table: str, node: str

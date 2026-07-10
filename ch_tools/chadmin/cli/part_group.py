@@ -1,11 +1,14 @@
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
-from click import Context
+from click import Context, Path
 from cloup import Choice, group, option, option_group, pass_context
 from cloup.constraints import If, IsSet, RequireAtLeast, RequireExactly
 
 from ch_tools.chadmin.cli.chadmin_group import Chadmin
+from ch_tools.chadmin.internal.object_storage.broken_part_recovery import (
+    recover_part,
+)
 from ch_tools.chadmin.internal.part import (
     attach_part,
     detach_part,
@@ -664,6 +667,55 @@ def remove_detached_part_prefix_command(
                 logging.warning("{!r}\n", e)
             else:
                 raise
+
+
+@part_group.command("recover")
+@option(
+    "-d",
+    "--database",
+    help="Source database. Optional with --path when it can be inferred.",
+)
+@option(
+    "-t",
+    "--table",
+    help="Source table. Optional with --path when it can be inferred.",
+)
+@option(
+    "--name",
+    "--part",
+    "part_name",
+    help="Detached part name. Requires --database and --table.",
+)
+@option(
+    "--path",
+    "part_path",
+    type=Path(exists=True, file_okay=False, path_type=str),
+    help="Absolute path to a detached part.",
+)
+@option(
+    "--target-table",
+    required=True,
+    help="New recovery table in DATABASE.TABLE form.",
+)
+@pass_context
+def recover_part_command(
+    ctx: Context,
+    database: Optional[str],
+    table: Optional[str],
+    part_name: Optional[str],
+    part_path: Optional[str],
+    target_table: str,
+) -> None:
+    """Recover intact data from a broken detached object-storage part."""
+    result = recover_part(
+        ctx,
+        database,
+        table,
+        part_name,
+        part_path,
+        target_table,
+    )
+    print_response(ctx, result, default_format="table")
 
 
 @part_group.command("check")

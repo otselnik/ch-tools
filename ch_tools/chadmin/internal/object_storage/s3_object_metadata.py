@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
+from boto3 import client as Boto3Client
+from botocore.exceptions import ClientError
+
 MAX_METADATA_FILE_SIZE = 10 * 1024
 VERSION_FULL_OBJECT_KEY = 5
 
@@ -109,3 +112,22 @@ class S3ObjectLocalMetaData:
         Whether key also contains object storage prefix or not.
         """
         return self._version_with_full_object_key(self.version)
+
+
+def get_object_storage_key(prefix: str, object_info: S3ObjectLocalInfo) -> str:
+    """Return an object key with the configured disk prefix applied."""
+    if object_info.key_is_full:
+        return object_info.key
+    return "/".join((prefix.rstrip("/"), object_info.key.lstrip("/")))
+
+
+def object_exists(s3_client: Boto3Client, bucket: str, key: str) -> bool:
+    """Check an object without hiding authorization or transport errors."""
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+    return True
