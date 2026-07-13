@@ -251,6 +251,131 @@ def test_clickhouse_disks_uses_argument_list_without_shell(
     assert run.call_args.kwargs["check"] is False
 
 
+@pytest.mark.parametrize(
+    "version,parents,expected_tail",
+    [
+        ("24.6.1.1", True, ["mkdir", "--recursive", "nested/path"]),
+        (
+            "24.7.1.1",
+            True,
+            ["--query", "mkdir 'nested/path' --parents"],
+        ),
+        ("24.6.1.1", False, ["mkdir", "nested/path"]),
+        ("24.7.1.1", False, ["--query", "mkdir 'nested/path'"]),
+    ],
+)
+@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
+@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
+def test_clickhouse_disks_mkdir_uses_version_specific_recursive_option(
+    run: MagicMock,
+    _logging: MagicMock,
+    version: str,
+    parents: bool,
+    expected_tail: list[str],
+) -> None:
+    run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
+    client = ClickHouseDiskClient("s3", version, "/tmp/disks.xml")
+
+    client.mkdir("nested/path", parents=parents)
+
+    arguments = run.call_args.args[0]
+    assert arguments[-len(expected_tail) :] == expected_tail
+
+
+def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = recovery.RecoverySource(
+        SourceTable(
+            TableRef("source_db", "source"),
+            "MergeTree",
+            "s3",
+            ["/disk/source"],
+        ),
+        DiskInfo("s3", Path("/disk"), "s3"),
+        Path("/disk/source/detached/part"),
+        "source/detached/part",
+        "part",
+    )
+    column = PartColumn("value", "UInt64", "`value` UInt64")
+    analysis = recovery.RecoveryAnalysis(
+        "Wide",
+        [column],
+        [column],
+        {},
+        set(),
+        1,
+        None,
+        None,
+    )
+    disk_conf = MagicMock(
+        endpoint_url="http://minio",
+        access_key_id="key",
+        secret_access_key="secret",
+    )
+    monkeypatch.setattr(
+        recovery, "resolve_recovery_source", MagicMock(return_value=source)
+    )
+    monkeypatch.setattr(recovery, "_assert_target_absent", MagicMock())
+    monkeypatch.setattr(
+        recovery,
+        "get_clickhouse_config",
+        MagicMock(return_value=MagicMock(storage_configuration=MagicMock())),
+    )
+    monkeypatch.setattr(
+        recovery.S3DiskConfiguration,
+        "from_config",
+        MagicMock(return_value=disk_conf),
+    )
+    monkeypatch.setattr(recovery.boto3, "client", MagicMock())
+    monkeypatch.setattr(recovery, "ClickHouseDiskClient", MagicMock())
+    monkeypatch.setattr(recovery, "get_version", MagicMock(return_value="24.8"))
+    monkeypatch.setattr(recovery, "inspect_logical_files", MagicMock(return_value={}))
+    monkeypatch.setattr(recovery, "analyze_part", MagicMock(return_value=analysis))
+    monkeypatch.setattr(
+        recovery.uuid,
+        "uuid4",
+        MagicMock(return_value=MagicMock(hex="stage")),
+    )
+
+
+def test_stage_creation_failure_does_not_attempt_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_recover_part_dependencies(monkeypatch)
+    create_table = MagicMock(side_effect=RuntimeError("stage creation failed"))
+    delete_table = MagicMock()
+    monkeypatch.setattr(recovery, "_create_recovery_table", create_table)
+    monkeypatch.setattr(recovery, "delete_table", delete_table)
+    ctx = MagicMock()
+    ctx.obj = {"config": {"object_storage": {"bucket_name_prefix": "", "retries": {}}}}
+
+    with pytest.raises(RuntimeError, match="stage creation failed"):
+        recovery.recover_part(ctx, None, None, None, "/part", "target.data")
+
+    create_table.assert_called_once()
+    delete_table.assert_not_called()
+
+
+def test_successfully_created_stage_is_cleaned_up_after_later_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_recover_part_dependencies(monkeypatch)
+    delete_table = MagicMock()
+    monkeypatch.setattr(recovery, "_create_recovery_table", MagicMock())
+    monkeypatch.setattr(
+        recovery,
+        "_prepare_staging_part",
+        MagicMock(side_effect=RuntimeError("staging failed")),
+    )
+    monkeypatch.setattr(recovery, "delete_table", delete_table)
+    ctx = MagicMock()
+    ctx.obj = {"config": {"object_storage": {"bucket_name_prefix": "", "retries": {}}}}
+
+    with pytest.raises(RuntimeError, match="staging failed"):
+        recovery.recover_part(ctx, None, None, None, "/part", "target.data")
+
+    delete_table.assert_called_once_with(ctx, "source_db", "_chadmin_recover_stage")
+
+
 def test_object_storage_key_respects_metadata_version() -> None:
     relative = S3ObjectLocalInfo("object", 1, False)
     full = S3ObjectLocalInfo("other/object", 1, True)

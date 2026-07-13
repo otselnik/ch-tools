@@ -765,13 +765,13 @@ def recover_part(
     target_created = False
     stage_created = False
     try:
-        stage_created = True
         _create_recovery_table(
             ctx,
             stage,
             [column for column in analysis.columns if column.name != ROW_EXISTS_COLUMN],
             source.table.storage_policy,
         )
+        stage_created = True
         stage_part_path = _prepare_staging_part(
             ctx, disk_client, source, stage, analysis, files
         )

@@ -95,7 +95,7 @@ class ClickHouseDiskClient:
 
     def mkdir(self, path: str, parents: bool = False) -> None:
         suffix = " --parents" if parents else ""
-        legacy_arguments = ["mkdir", *(["--parents"] if parents else []), path]
+        legacy_arguments = ["mkdir", *(["--recursive"] if parents else []), path]
         self._run(f"mkdir {self._quote(path)}{suffix}", legacy_arguments)
 
     def remove(self, path: str, recursive: bool = False) -> None:
