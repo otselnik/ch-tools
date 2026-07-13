@@ -18,6 +18,12 @@ S3_METADATA_STORE_PATH = S3_PATH + "/store"
 OBJECT_STORAGE_DISK_TYPES = ["s3", "object_storage", "ObjectStorage"]
 
 
+def _quote_path(path: str) -> str:
+    if "'" in path or "\n" in path or "\r" in path:
+        raise ValueError(f"Unsupported clickhouse-disks path: {path!r}")
+    return f"'{path}'"
+
+
 @dataclass(frozen=True)
 class ClickHouseDiskResult:
     stdout: bytes
@@ -70,28 +76,22 @@ class ClickHouseDiskClient:
             )
         return ClickHouseDiskResult(proc.stdout, proc.stderr)
 
-    @staticmethod
-    def _quote(path: str) -> str:
-        if "'" in path or "\n" in path or "\r" in path:
-            raise ValueError(f"Unsupported clickhouse-disks path: {path!r}")
-        return f"'{path}'"
-
     def read(self, path: str) -> bytes:
-        return self._run(f"read {self._quote(path)}").stdout
+        return self._run(f"read {_quote_path(path)}").stdout
 
     def write(self, path: str, content: bytes) -> None:
-        self._run(f"write {self._quote(path)}", stdin=content)
+        self._run(f"write {_quote_path(path)}", stdin=content)
 
     def copy(self, source: str, target: str) -> None:
-        self._run(f"copy {self._quote(source)} {self._quote(target)}")
+        self._run(f"copy {_quote_path(source)} {_quote_path(target)}")
 
     def mkdir(self, path: str, parents: bool = False) -> None:
         suffix = " --parents" if parents else ""
-        self._run(f"mkdir {self._quote(path)}{suffix}")
+        self._run(f"mkdir {_quote_path(path)}{suffix}")
 
     def remove(self, path: str, recursive: bool = False) -> None:
         suffix = " --recursive" if recursive else ""
-        self._run(f"remove {self._quote(path)}{suffix}")
+        self._run(f"remove {_quote_path(path)}{suffix}")
 
 
 def make_ch_disks_config(disk: str) -> str:
@@ -118,20 +118,27 @@ def remove_from_ch_disk(
     disk_config_path: Optional[str] = None,
     dry_run: bool = False,
 ) -> Tuple[int, bytes]:
-    cmd = f"clickhouse-disks {'-C ' + disk_config_path if disk_config_path else ''} --disk {disk}"
+    args = ["clickhouse-disks"]
+    if disk_config_path:
+        args.extend(["-C", disk_config_path])
+    args.extend(["--disk", disk])
     if version_ge(ch_version, "24.7"):
-        cmd += f' --query "remove {path} --recursive"'
+        args.extend(
+            [
+                "--query",
+                f"remove {_quote_path(path)} --recursive",
+            ]
+        )
     else:
-        cmd += f" remove {path}"
+        args.extend(["remove", path])
 
-    logging.info("Run : {}", cmd)
+    logging.info("Run: {}", args)
 
     if dry_run:
         return (0, b"")
 
     proc = subprocess.run(
-        cmd,
-        shell=True,
+        args,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
