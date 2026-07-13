@@ -1,6 +1,6 @@
 import subprocess
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import xmltodict
 
@@ -30,20 +30,17 @@ class ClickHouseDiskClient:
     def __init__(
         self,
         disk: str,
-        ch_version: str,
         disk_config_path: Optional[str] = None,
     ) -> None:
         self.disk = disk
-        self.ch_version = ch_version
         self.disk_config_path = disk_config_path or make_ch_disks_config(disk)
 
     def _run(
         self,
         command: str,
-        legacy_arguments: List[str],
         stdin: Optional[bytes] = None,
     ) -> ClickHouseDiskResult:
-        base = [
+        args = [
             "sudo",
             "-u",
             "clickhouse",
@@ -54,11 +51,9 @@ class ClickHouseDiskClient:
             self.disk_config_path,
             "--disk",
             self.disk,
+            "--query",
+            command,
         ]
-        if version_ge(self.ch_version, "24.7"):
-            args = base + ["--query", command]
-        else:
-            args = base + legacy_arguments
 
         logging.info("Run clickhouse-disks command: {}", command)
         proc = subprocess.run(
@@ -82,25 +77,21 @@ class ClickHouseDiskClient:
         return f"'{path}'"
 
     def read(self, path: str) -> bytes:
-        return self._run(f"read {self._quote(path)}", ["read", path]).stdout
+        return self._run(f"read {self._quote(path)}").stdout
 
     def write(self, path: str, content: bytes) -> None:
-        self._run(f"write {self._quote(path)}", ["write", path], stdin=content)
+        self._run(f"write {self._quote(path)}", stdin=content)
 
     def copy(self, source: str, target: str) -> None:
-        self._run(
-            f"copy {self._quote(source)} {self._quote(target)}",
-            ["copy", source, target],
-        )
+        self._run(f"copy {self._quote(source)} {self._quote(target)}")
 
     def mkdir(self, path: str, parents: bool = False) -> None:
         suffix = " --parents" if parents else ""
-        legacy_arguments = ["mkdir", *(["--recursive"] if parents else []), path]
-        self._run(f"mkdir {self._quote(path)}{suffix}", legacy_arguments)
+        self._run(f"mkdir {self._quote(path)}{suffix}")
 
     def remove(self, path: str, recursive: bool = False) -> None:
         suffix = " --recursive" if recursive else ""
-        self._run(f"remove {self._quote(path)}{suffix}", ["remove", path])
+        self._run(f"remove {self._quote(path)}{suffix}")
 
 
 def make_ch_disks_config(disk: str) -> str:

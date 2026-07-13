@@ -25,6 +25,7 @@ from ch_tools.chadmin.internal.utils import execute_query
 from ch_tools.common import logging
 from ch_tools.common.clickhouse.config import get_clickhouse_config
 from ch_tools.common.clickhouse.config.storage_configuration import S3DiskConfiguration
+from ch_tools.common.utils import version_ge
 
 # pylint: disable=too-many-lines
 
@@ -36,6 +37,7 @@ SERIALIZATION_FILE = "serialization.json"
 ROW_EXISTS_COLUMN = "_row_exists"
 RECOVERY_ROW_EXISTS_COLUMN = "_recovery_row_exists"
 STAGING_PART_NAME = "all_0_0_0"
+MIN_CLICKHOUSE_VERSION = "25.8"
 MARK_SUFFIX_RE = re.compile(r"\.(?:c?mrk\d*)$")
 
 
@@ -734,6 +736,12 @@ def recover_part(
     part_path: Optional[str],
     target_table: str,
 ) -> List[Dict[str, Any]]:
+    ch_version = get_version(ctx)
+    if not version_ge(ch_version, MIN_CLICKHOUSE_VERSION):
+        raise RuntimeError(
+            f"Part recovery requires ClickHouse version {MIN_CLICKHOUSE_VERSION} or above"
+        )
+
     target = parse_qualified_table(target_table)
     source = resolve_recovery_source(ctx, database, table, part_name, part_path)
     _assert_target_absent(ctx, target)
@@ -754,7 +762,7 @@ def recover_part(
             retries=ctx.obj["config"]["object_storage"].get("retries"),
         ),
     )
-    disk_client = ClickHouseDiskClient(source.disk.name, get_version(ctx))
+    disk_client = ClickHouseDiskClient(source.disk.name)
     files = inspect_logical_files(source, s3_client, disk_conf)
     analysis = analyze_part(ctx, disk_client, source, files)
 

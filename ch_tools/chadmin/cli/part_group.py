@@ -706,7 +706,10 @@ def recover_part_command(
     part_path: Optional[str],
     target_table: str,
 ) -> None:
-    """Recover intact data from a broken detached object-storage part."""
+    """Recover intact data from a broken detached object-storage part.
+
+    Requires ClickHouse 25.8 or above.
+    """
     result = recover_part(
         ctx,
         database,

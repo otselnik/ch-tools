@@ -215,26 +215,14 @@ def test_unresolved_path_without_table_is_an_error(
         recovery.resolve_recovery_source(MagicMock(), None, None, None, str(part_path))
 
 
-@pytest.mark.parametrize(
-    "version,expected_tail",
-    [
-        ("24.6.1.1", ["read", "path with spaces/file.bin"]),
-        (
-            "24.7.1.1",
-            ["--query", "read 'path with spaces/file.bin'"],
-        ),
-    ],
-)
 @patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
 @patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
 def test_clickhouse_disks_uses_argument_list_without_shell(
     run: MagicMock,
     _logging: MagicMock,
-    version: str,
-    expected_tail: list[str],
 ) -> None:
     run.return_value = MagicMock(returncode=0, stdout=b"data", stderr=b"")
-    client = ClickHouseDiskClient("s3", version, "/tmp/disks.xml")
+    client = ClickHouseDiskClient("s3", "/tmp/disks.xml")
 
     assert client.read("path with spaces/file.bin") == b"data"
 
@@ -247,39 +235,71 @@ def test_clickhouse_disks_uses_argument_list_without_shell(
         "HOME=/tmp",
         "clickhouse-disks",
     ]
-    assert arguments[-2:] == expected_tail
+    assert arguments[-2:] == ["--query", "read 'path with spaces/file.bin'"]
     assert run.call_args.kwargs["check"] is False
+    assert "shell" not in run.call_args.kwargs
 
 
 @pytest.mark.parametrize(
-    "version,parents,expected_tail",
+    "parents,expected_query",
     [
-        ("24.6.1.1", True, ["mkdir", "--recursive", "nested/path"]),
-        (
-            "24.7.1.1",
-            True,
-            ["--query", "mkdir 'nested/path' --parents"],
-        ),
-        ("24.6.1.1", False, ["mkdir", "nested/path"]),
-        ("24.7.1.1", False, ["--query", "mkdir 'nested/path'"]),
+        (True, "mkdir 'nested/path' --parents"),
+        (False, "mkdir 'nested/path'"),
     ],
 )
 @patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
 @patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
-def test_clickhouse_disks_mkdir_uses_version_specific_recursive_option(
+def test_clickhouse_disks_mkdir_uses_query_interface(
     run: MagicMock,
     _logging: MagicMock,
-    version: str,
     parents: bool,
-    expected_tail: list[str],
+    expected_query: str,
 ) -> None:
     run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
-    client = ClickHouseDiskClient("s3", version, "/tmp/disks.xml")
+    client = ClickHouseDiskClient("s3", "/tmp/disks.xml")
 
     client.mkdir("nested/path", parents=parents)
 
     arguments = run.call_args.args[0]
-    assert arguments[-len(expected_tail) :] == expected_tail
+    assert arguments[-2:] == ["--query", expected_query]
+
+
+@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
+@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
+def test_clickhouse_disks_copy_and_recursive_remove_use_query_interface(
+    run: MagicMock,
+    _logging: MagicMock,
+) -> None:
+    run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
+    client = ClickHouseDiskClient("s3", "/tmp/disks.xml")
+
+    client.copy("source/file.bin", "target/file.bin")
+    client.remove("target", recursive=True)
+
+    assert run.call_args_list[0].args[0][-2:] == [
+        "--query",
+        "copy 'source/file.bin' 'target/file.bin'",
+    ]
+    assert run.call_args_list[1].args[0][-2:] == [
+        "--query",
+        "remove 'target' --recursive",
+    ]
+
+
+def test_recover_part_rejects_unsupported_clickhouse_before_source_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolve_source = MagicMock()
+    monkeypatch.setattr(recovery, "get_version", MagicMock(return_value="25.7.9.1"))
+    monkeypatch.setattr(recovery, "resolve_recovery_source", resolve_source)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Part recovery requires ClickHouse version 25.8 or above",
+    ):
+        recovery.recover_part(MagicMock(), None, None, None, "/part", "target.data")
+
+    resolve_source.assert_not_called()
 
 
 def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -327,7 +347,7 @@ def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(recovery.boto3, "client", MagicMock())
     monkeypatch.setattr(recovery, "ClickHouseDiskClient", MagicMock())
-    monkeypatch.setattr(recovery, "get_version", MagicMock(return_value="24.8"))
+    monkeypatch.setattr(recovery, "get_version", MagicMock(return_value="25.8"))
     monkeypatch.setattr(recovery, "inspect_logical_files", MagicMock(return_value={}))
     monkeypatch.setattr(recovery, "analyze_part", MagicMock(return_value=analysis))
     monkeypatch.setattr(

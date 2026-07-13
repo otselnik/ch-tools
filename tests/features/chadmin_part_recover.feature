@@ -5,6 +5,7 @@ Feature: Recover data from broken detached object-storage parts
     And a working s3
     And a working clickhouse on clickhouse01
 
+  @require_version_25.8
   Scenario: Recover a Wide part by inferred and explicit source table
     When we execute queries on clickhouse01
     """
@@ -107,4 +108,15 @@ Feature: Recover data from broken detached object-storage parts
     1\tone
     2\ttwo
     3\tthree
+    """
+
+  @require_version_less_than_25.8
+  Scenario: Reject part recovery on an unsupported ClickHouse version
+    When we try to execute command on clickhouse01
+    """
+    chadmin part recover --database default --table source --name all_1_1_0 --target-table recovered.data
+    """
+    Then it fails with response contains
+    """
+    Part recovery requires ClickHouse version 25.8 or above
     """
