@@ -17,9 +17,9 @@ from ch_tools.chadmin.internal.clickhouse_disks import (
     remove_from_ch_disk,
 )
 from ch_tools.chadmin.internal.object_storage.broken_partitions_recovery import (
+    detach_broken_partition,
     find_broken_parts,
     make_partition_report,
-    repair_broken_partition,
     restore_recoverable_broken_partitions,
 )
 from ch_tools.chadmin.internal.system import get_version
@@ -368,7 +368,6 @@ def collect_orphaned_sql_objects_recursive(
     help="Flag to restore safely recoverable missing S3 objects.",
 )
 @constraint(AcceptAtMost(1), ["detach", "reattach"])
-@constraint(AcceptAtMost(1), ["reattach", "restore_recoverable"])
 @pass_context
 def detect_broken_partitions(
     ctx: Context,
@@ -398,6 +397,7 @@ def detect_broken_partitions(
             s3_client=s3_client,
             disk_conf=disk_conf,
             detach_unrecoverable=detach,
+            reattach_unrecoverable=reattach,
         )
         print_response(ctx, restore_report, default_format="table")
         return
@@ -431,9 +431,9 @@ def detect_broken_partitions(
             part_info.partition_id,
         )
         if detach:
-            repair_broken_partition(ctx, part_info, attach=False)
+            detach_broken_partition(ctx, part_info, reattach=False)
         elif reattach:
-            repair_broken_partition(ctx, part_info)
+            detach_broken_partition(ctx, part_info)
 
     repaired_partitions.sort(key=lambda item: (item["table"], item["partition"]))
     print_response(ctx, repaired_partitions, default_format="table")

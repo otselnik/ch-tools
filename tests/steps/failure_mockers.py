@@ -46,17 +46,48 @@ def step_remove_keys_from_s3_for_partition(
 def step_remove_s3_object_for_active_part_file(
     context: ContextT, filename: str, database: str, table: str, node: str
 ) -> None:
+    remove_s3_object_for_active_part_file(
+        context, filename, database, table, node, part_index=0
+    )
+
+
+@when(
+    "we remove s3 object for active part {part_index:d} file {filename} "
+    "from table {database}.{table} on {node:w}"
+)
+def step_remove_s3_object_for_selected_active_part_file(
+    context: ContextT,
+    part_index: int,
+    filename: str,
+    database: str,
+    table: str,
+    node: str,
+) -> None:
+    remove_s3_object_for_active_part_file(
+        context, filename, database, table, node, part_index
+    )
+
+
+def remove_s3_object_for_active_part_file(
+    context: ContextT,
+    filename: str,
+    database: str,
+    table: str,
+    node: str,
+    part_index: int,
+) -> None:
     part_path_query = (
         "SELECT path FROM system.parts "
         f"WHERE database='{database}' AND table='{table}' AND active "
-        "ORDER BY name LIMIT 1"
+        f"ORDER BY name LIMIT 1 OFFSET {part_index}"
     )
     part_data = execute_query(context, node, part_path_query, format_="JSONCompact")[
         "data"
     ]
     if not part_data:
         raise AssertionError(
-            f"No active part found for table {database}.{table} on node {node} "
+            f"No active part {part_index} found for table {database}.{table} "
+            f"on node {node} "
             f"when trying to remove S3 object for file {filename}"
         )
     part_path = part_data[0][0]

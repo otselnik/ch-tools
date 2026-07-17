@@ -31,6 +31,13 @@ from ch_tools.common.clickhouse.config.storage_configuration import S3DiskConfig
 ATTACH_DETACH_QUERY_RETRY = 10
 
 
+@dataclass(frozen=True, order=True)
+class PartitionKey:
+    database: str
+    table: str
+    partition_id: str
+
+
 @dataclass(frozen=True)
 class BrokenPartInfo:
     database: str
@@ -62,6 +69,14 @@ class BrokenPart:
     missing_objects: List[MissingObject]
 
 
+@dataclass
+class PartRecoveryResult:
+    part_info: BrokenPartInfo
+    reports: List[Dict[str, Any]]
+    attach_files: List[str]
+    has_unresolved: bool
+
+
 def check_key_in_object_storage(s3_client: Boto3Client, bucket: str, key: str) -> bool:
     try:
         s3_client.head_object(Bucket=bucket, Key=key)
@@ -79,20 +94,72 @@ def restore_recoverable_broken_partitions(
     s3_client: Boto3Client,
     disk_conf: S3DiskConfiguration,
     detach_unrecoverable: bool,
+    reattach_unrecoverable: bool,
 ) -> List[Dict[str, Any]]:
     broken_parts = find_broken_parts(ctx, root_path, s3_client, disk_conf)
     result: List[Dict[str, Any]] = []
 
+    broken_parts_by_partition: Dict[PartitionKey, List[BrokenPart]] = {}
     for broken_part in broken_parts:
-        result.extend(
+        part_info = broken_part.info
+        partition_key = PartitionKey(
+            database=part_info.database,
+            table=part_info.table,
+            partition_id=part_info.partition_id,
+        )
+        broken_parts_by_partition.setdefault(partition_key, []).append(broken_part)
+
+    for partition_key in sorted(broken_parts_by_partition):
+        partition_broken_parts = broken_parts_by_partition[partition_key]
+        recovery_results = [
             restore_recoverable_broken_part(
-                ctx=ctx,
                 broken_part=broken_part,
                 s3_client=s3_client,
                 bucket=disk_conf.bucket_name,
-                detach_unrecoverable=detach_unrecoverable,
             )
-        )
+            for broken_part in partition_broken_parts
+        ]
+        for recovery_result in recovery_results:
+            result.extend(recovery_result.reports)
+
+        attach_requests = [
+            (recovery_result.part_info, recovery_result.attach_files)
+            for recovery_result in recovery_results
+            if recovery_result.attach_files
+        ]
+        excluded_parts = [
+            recovery_result.part_info
+            for recovery_result in recovery_results
+            if recovery_result.has_unresolved and not recovery_result.attach_files
+        ]
+        attach_attempted = bool(attach_requests)
+        attach_succeeded = False
+        attach_reports: List[Dict[str, Any]] = []
+        if attach_requests:
+            attach_reports, attach_succeeded = restore_files_via_attach(
+                ctx, attach_requests, excluded_parts
+            )
+            result.extend(attach_reports)
+
+        has_unresolved = any(
+            recovery_result.has_unresolved for recovery_result in recovery_results
+        ) or reports_have_unresolved(attach_reports)
+        if not has_unresolved:
+            continue
+
+        partition_info = partition_broken_parts[0].info
+        if detach_unrecoverable:
+            result.append(detach_unrecoverable_partition(ctx, partition_info))
+        elif reattach_unrecoverable:
+            if not attach_attempted:
+                attach_succeeded = detach_broken_partition(
+                    ctx, partition_info, reattach=True
+                )
+            result.append(
+                make_partition_action_report(
+                    partition_info, reattach=True, success=attach_succeeded
+                )
+            )
 
     return result
 
@@ -108,6 +175,8 @@ def find_broken_parts(
 
     for path, _, files in os.walk(root_path):
         part_info = active_parts_by_path.get(f"{path}/")
+        if part_info is None:
+            continue
 
         for file in files:
             metadata_path = Path(path) / file
@@ -125,10 +194,6 @@ def find_broken_parts(
                     s3_client, disk_conf.bucket_name, object_key
                 ):
                     continue
-
-                if part_info is None:
-                    logging.warning("Skip failed path {}.", path)
-                    break
 
                 broken_part = broken_parts_by_path.setdefault(
                     path,
@@ -148,14 +213,11 @@ def find_broken_parts(
 
 
 def restore_recoverable_broken_part(
-    ctx: Context,
     broken_part: BrokenPart,
     s3_client: Boto3Client,
     bucket: str,
-    detach_unrecoverable: bool,
-) -> List[Dict[str, Any]]:
+) -> PartRecoveryResult:
     report: List[Dict[str, Any]] = []
-    unrecoverable = False
 
     missing_by_file: Dict[str, List[MissingObject]] = {}
     for missing_object in broken_part.missing_objects:
@@ -169,9 +231,13 @@ def restore_recoverable_broken_part(
             or (filename == "columns.txt" and can_restore_columns_txt(broken_part.info))
             for filename in filenames
         ):
-            return restore_files_via_attach(ctx, broken_part.info, filenames)
+            return PartRecoveryResult(
+                part_info=broken_part.info,
+                reports=[],
+                attach_files=filenames,
+                has_unresolved=False,
+            )
 
-        unrecoverable = True
         for filename in filenames:
             report.append(
                 make_restore_report(
@@ -182,13 +248,15 @@ def restore_recoverable_broken_part(
                 )
             )
 
-        if detach_unrecoverable and unrecoverable:
-            report.append(detach_unrecoverable_part(ctx, broken_part.info))
-        return report
+        return PartRecoveryResult(
+            part_info=broken_part.info,
+            reports=report,
+            attach_files=[],
+            has_unresolved=True,
+        )
 
     for filename, missing_objects in sorted(missing_by_file.items()):
         if filename in supported_attach_files:
-            unrecoverable = True
             report.append(
                 make_restore_report(
                     broken_part.info,
@@ -215,18 +283,20 @@ def restore_recoverable_broken_part(
                 )
             )
         elif filename == "default_compression_codec.txt":
+            codec = broken_part.info.default_compression_codec
+            if not codec.startswith("CODEC("):
+                codec = f"CODEC({codec})"
             report.append(
                 restore_generated_file(
                     broken_part.info,
                     filename,
-                    broken_part.info.default_compression_codec.encode("utf-8"),
+                    codec.encode("utf-8"),
                     missing_objects,
                     s3_client,
                     bucket,
                 )
             )
         else:
-            unrecoverable = True
             report.append(
                 make_restore_report(
                     broken_part.info,
@@ -236,10 +306,12 @@ def restore_recoverable_broken_part(
                 )
             )
 
-    if detach_unrecoverable and unrecoverable:
-        report.append(detach_unrecoverable_part(ctx, broken_part.info))
-
-    return report
+    return PartRecoveryResult(
+        part_info=broken_part.info,
+        reports=report,
+        attach_files=[],
+        has_unresolved=reports_have_unresolved(report),
+    )
 
 
 def restore_empty_objects(
@@ -323,105 +395,204 @@ def restore_generated_file(
 
 
 def restore_files_via_attach(
-    ctx: Context, part_info: BrokenPartInfo, filenames: List[str]
-) -> List[Dict[str, Any]]:
-    if not detach_partition_with_retry(ctx, part_info):
-        return [
-            make_restore_report(
-                part_info,
-                filename,
-                "detach_failed",
-                "failed to detach part before metadata regeneration",
-            )
-            for filename in filenames
-        ]
-
-    detached_part_path = get_detached_part_path(ctx, part_info)
-    if detached_part_path is None:
-        attach_partition_with_retry(ctx, part_info)
-        return [
-            make_restore_report(
-                part_info,
-                filename,
-                "unrecoverable",
-                "detached part path was not found",
-            )
-            for filename in filenames
-        ]
-
-    backups: List[Tuple[Path, Path]] = []
-    try:
-        for filename in filenames:
-            pointer_path = detached_part_path / filename
-            if pointer_path.exists():
-                backup_path = make_backup_path(
-                    detached_part_path, part_info.name, filename
+    ctx: Context,
+    attach_requests: List[Tuple[BrokenPartInfo, List[str]]],
+    excluded_parts: List[BrokenPartInfo],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    partition_info = attach_requests[0][0]
+    if not detach_partition_with_retry(ctx, partition_info):
+        return (
+            [
+                make_restore_report(
+                    part_info,
+                    filename,
+                    "detach_failed",
+                    "failed to detach partition before metadata regeneration",
                 )
-                pointer_path.rename(backup_path)
-                backups.append((backup_path, pointer_path))
+                for part_info, filenames in attach_requests
+                for filename in filenames
+            ],
+            False,
+        )
 
-        if attach_partition_with_retry(ctx, part_info):
+    affected_parts = [part_info for part_info, _ in attach_requests] + excluded_parts
+    detached_part_paths = {
+        part_info.name: get_detached_part_path(ctx, part_info)
+        for part_info in affected_parts
+    }
+    missing_part_names = sorted(
+        part_info.name
+        for part_info in affected_parts
+        if detached_part_paths[part_info.name] is None
+    )
+    if missing_part_names:
+        attach_succeeded = attach_partition_with_retry(ctx, partition_info)
+        return (
+            [
+                make_restore_report(
+                    part_info,
+                    filename,
+                    "unrecoverable",
+                    "detached part paths were not found: "
+                    + ", ".join(missing_part_names),
+                )
+                for part_info, filenames in attach_requests
+                for filename in filenames
+            ],
+            attach_succeeded,
+        )
+
+    isolated_parts: List[Tuple[Path, Path]] = []
+    try:
+        isolated_parts = isolate_detached_parts(detached_part_paths, excluded_parts)
+    except OSError as e:
+        restore_isolated_part_paths(isolated_parts)
+        attach_succeeded = attach_partition_with_retry(ctx, partition_info)
+        return (
+            [
+                make_restore_report(
+                    part_info,
+                    filename,
+                    "unrecoverable",
+                    f"failed to isolate unrecoverable part: {e}",
+                )
+                for part_info, filenames in attach_requests
+                for filename in filenames
+            ],
+            attach_succeeded,
+        )
+
+    backups_by_part: Dict[str, List[Tuple[Path, Path]]] = {}
+    try:
+        for part_info, filenames in attach_requests:
+            detached_part_path = detached_part_paths[part_info.name]
+            assert detached_part_path is not None
+            for filename in filenames:
+                pointer_path = detached_part_path / filename
+                if pointer_path.exists():
+                    backup_path = make_backup_path(
+                        detached_part_path, part_info.name, filename
+                    )
+                    pointer_path.rename(backup_path)
+                    backups_by_part.setdefault(part_info.name, []).append(
+                        (backup_path, pointer_path)
+                    )
+    except OSError as e:
+        for backups in backups_by_part.values():
+            restore_backup_paths(backups)
+        restore_isolated_part_paths(isolated_parts)
+        attach_succeeded = attach_partition_with_retry(ctx, partition_info)
+        return (
+            [
+                make_restore_report(
+                    part_info,
+                    filename,
+                    "unrecoverable",
+                    f"failed to move metadata pointer: {e}",
+                )
+                for part_info, filenames in attach_requests
+                for filename in filenames
+            ],
+            attach_succeeded,
+        )
+
+    attach_succeeded = attach_partition_with_retry(ctx, partition_info)
+    restore_isolated_part_paths(isolated_parts)
+    if attach_succeeded:
+        for backups in backups_by_part.values():
             for backup_path, _ in backups:
                 cleanup_backup_path(backup_path)
-            return [
+        return (
+            [
                 make_restore_report(
                     part_info,
                     filename,
                     "restored",
                     "regenerated by ClickHouse ATTACH PARTITION",
                 )
+                for part_info, filenames in attach_requests
                 for filename in filenames
-            ]
+            ],
+            True,
+        )
 
-        restore_backup_paths(backups)
-        return [
-            make_restore_report(
-                part_info,
-                filename,
-                "attach_failed",
-                "ClickHouse failed to attach part after pointer removal",
+    active_part_names = {
+        part["name"]
+        for part in list_parts(
+            ctx,
+            database=partition_info.database,
+            table=partition_info.table,
+            partition_id=partition_info.partition_id,
+            active=True,
+        )
+    }
+    reports: List[Dict[str, Any]] = []
+    all_requested_parts_attached = True
+    for part_info, filenames in attach_requests:
+        part_attached = part_info.name in active_part_names
+        all_requested_parts_attached = all_requested_parts_attached and part_attached
+        backups = backups_by_part.get(part_info.name, [])
+        if part_attached:
+            for backup_path, _ in backups:
+                cleanup_backup_path(backup_path)
+        else:
+            restore_backup_paths(backups)
+        for filename in filenames:
+            reports.append(
+                make_restore_report(
+                    part_info,
+                    filename,
+                    "restored" if part_attached else "attach_failed",
+                    (
+                        "regenerated by ClickHouse ATTACH PARTITION"
+                        if part_attached
+                        else "ClickHouse failed to attach part after pointer removal"
+                    ),
+                )
             )
-            for filename in filenames
-        ]
-    except OSError as e:
-        restore_backup_paths(backups)
-        return [
-            make_restore_report(
-                part_info,
-                filename,
-                "unrecoverable",
-                f"failed to move metadata pointer: {e}",
-            )
-            for filename in filenames
-        ]
+    return reports, all_requested_parts_attached
 
 
-def repair_broken_partition(
-    ctx: Context, part_info: BrokenPartInfo, attach: bool = True
+def detach_broken_partition(
+    ctx: Context, part_info: BrokenPartInfo, reattach: bool = True
 ) -> bool:
     if not detach_partition_with_retry(ctx, part_info):
         return False
-    if attach:
+    if reattach:
         return attach_partition_with_retry(ctx, part_info)
     return True
 
 
-def detach_unrecoverable_part(
+def detach_unrecoverable_partition(
     ctx: Context, part_info: BrokenPartInfo
 ) -> Dict[str, Any]:
-    if repair_broken_partition(ctx, part_info, attach=False):
-        return make_restore_report(
-            part_info,
-            "*",
-            "detached",
-            "part has unrecoverable missing objects",
+    success = detach_broken_partition(ctx, part_info, reattach=False)
+    return make_partition_action_report(part_info, reattach=False, success=success)
+
+
+def make_partition_action_report(
+    part_info: BrokenPartInfo, reattach: bool, success: bool
+) -> Dict[str, Any]:
+    if reattach:
+        status = "reattached" if success else "reattach_failed"
+        detail = (
+            "healthy and restored parts were reattached; "
+            "unrecoverable parts remain detached"
+            if success
+            else "failed to reattach partition after recoverable restore"
         )
-    return make_restore_report(
-        part_info,
-        "*",
-        "detach_failed",
-        "failed to detach part with unrecoverable missing objects",
-    )
+    else:
+        status = "detached" if success else "detach_failed"
+        detail = (
+            "partition has unrecoverable missing objects"
+            if success
+            else "failed to detach partition with unrecoverable missing objects"
+        )
+    return make_restore_report(part_info, "*", status, detail)
+
+
+def reports_have_unresolved(reports: List[Dict[str, Any]]) -> bool:
+    return any(report["status"] != "restored" for report in reports)
 
 
 def can_restore_columns_txt(part_info: BrokenPartInfo) -> bool:
@@ -429,10 +600,51 @@ def can_restore_columns_txt(part_info: BrokenPartInfo) -> bool:
 
 
 def make_backup_path(detached_part_path: Path, part_name: str, filename: str) -> Path:
-    backup_dir = Path(
-        tempfile.mkdtemp(prefix=f"{part_name}.", dir=detached_part_path.parent)
+    descriptor, backup_path = tempfile.mkstemp(
+        prefix=f".{part_name}.{filename}.",
+        suffix=".bak",
+        dir=detached_part_path.parent.parent,
     )
-    return backup_dir / filename
+    os.close(descriptor)
+    path = Path(backup_path)
+    path.unlink()
+    return path
+
+
+def make_isolated_part_path(detached_part_path: Path, part_name: str) -> Path:
+    path = Path(
+        tempfile.mkdtemp(
+            prefix=f".{part_name}.",
+            suffix=".isolated",
+            dir=detached_part_path.parent.parent,
+        )
+    )
+    path.rmdir()
+    return path
+
+
+def isolate_detached_parts(
+    detached_part_paths: Dict[str, Optional[Path]],
+    excluded_parts: List[BrokenPartInfo],
+) -> List[Tuple[Path, Path]]:
+    isolated_parts: List[Tuple[Path, Path]] = []
+    try:
+        for part_info in excluded_parts:
+            detached_part_path = detached_part_paths[part_info.name]
+            assert detached_part_path is not None
+            isolated_path = make_isolated_part_path(detached_part_path, part_info.name)
+            detached_part_path.rename(isolated_path)
+            isolated_parts.append((isolated_path, detached_part_path))
+    except OSError:
+        restore_isolated_part_paths(isolated_parts)
+        raise
+    return isolated_parts
+
+
+def restore_isolated_part_paths(paths: List[Tuple[Path, Path]]) -> None:
+    for isolated_path, detached_part_path in reversed(paths):
+        if isolated_path.exists():
+            isolated_path.rename(detached_part_path)
 
 
 def cleanup_backup_path(backup_path: Optional[Path]) -> None:
@@ -440,14 +652,15 @@ def cleanup_backup_path(backup_path: Optional[Path]) -> None:
         return
     if backup_path.exists():
         backup_path.unlink()
-    backup_path.parent.rmdir()
 
 
 def restore_backup_paths(backups: List[Tuple[Path, Path]]) -> None:
     for backup_path, pointer_path in reversed(backups):
-        if backup_path.exists() and not pointer_path.exists():
-            backup_path.rename(pointer_path)
-        backup_path.parent.rmdir()
+        if backup_path.exists():
+            if pointer_path.exists():
+                backup_path.unlink()
+            else:
+                backup_path.rename(pointer_path)
 
 
 def make_restore_report(
