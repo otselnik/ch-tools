@@ -19,6 +19,7 @@ from ch_tools.chadmin.internal.clickhouse_disks import (
 from ch_tools.chadmin.internal.object_storage.broken_partitions_recovery import (
     detach_broken_partition,
     find_broken_parts,
+    group_broken_parts_by_partition,
     make_partition_report,
     restore_recoverable_broken_partitions,
 )
@@ -403,30 +404,18 @@ def detect_broken_partitions(
         return
 
     broken_parts = find_broken_parts(ctx, root_path, s3_client, disk_conf)
+    broken_parts_by_partition = group_broken_parts_by_partition(broken_parts)
     repaired_partitions = []
-    seen_partitions = set()
 
-    for broken_part in broken_parts:
+    for partition_key in sorted(broken_parts_by_partition):
+        partition_broken_parts = broken_parts_by_partition[partition_key]
+        broken_part = partition_broken_parts[0]
         part_info = broken_part.info
-        partition_key = (
-            part_info.database,
-            part_info.table,
-            part_info.partition_id,
-        )
-        if partition_key in seen_partitions:
-            logging.debug(
-                "Partition {} for table {} was already repaired. Skip.",
-                part_info.partition_id,
-                part_info.table_id,
-            )
-            continue
-
-        seen_partitions.add(partition_key)
         repaired_partitions.append(make_partition_report(part_info))
 
         logging.debug(
-            "Found the partition with missing blob in object storage: path={} table={} partition={}",
-            broken_part.path,
+            "Found the partition with missing blobs in object storage: paths={} table={} partition={}",
+            [item.path for item in partition_broken_parts],
             part_info.table_id,
             part_info.partition_id,
         )
@@ -435,7 +424,6 @@ def detect_broken_partitions(
         elif reattach:
             detach_broken_partition(ctx, part_info)
 
-    repaired_partitions.sort(key=lambda item: (item["table"], item["partition"]))
     print_response(ctx, repaired_partitions, default_format="table")
 
     logging.debug(

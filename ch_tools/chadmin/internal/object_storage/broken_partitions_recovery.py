@@ -99,15 +99,7 @@ def restore_recoverable_broken_partitions(
     broken_parts = find_broken_parts(ctx, root_path, s3_client, disk_conf)
     result: List[Dict[str, Any]] = []
 
-    broken_parts_by_partition: Dict[PartitionKey, List[BrokenPart]] = {}
-    for broken_part in broken_parts:
-        part_info = broken_part.info
-        partition_key = PartitionKey(
-            database=part_info.database,
-            table=part_info.table,
-            partition_id=part_info.partition_id,
-        )
-        broken_parts_by_partition.setdefault(partition_key, []).append(broken_part)
+    broken_parts_by_partition = group_broken_parts_by_partition(broken_parts)
 
     for partition_key in sorted(broken_parts_by_partition):
         partition_broken_parts = broken_parts_by_partition[partition_key]
@@ -132,11 +124,10 @@ def restore_recoverable_broken_partitions(
             for recovery_result in recovery_results
             if recovery_result.has_unresolved and not recovery_result.attach_files
         ]
-        attach_attempted = bool(attach_requests)
-        attach_succeeded = False
+        partition_reattached: Optional[bool] = None
         attach_reports: List[Dict[str, Any]] = []
         if attach_requests:
-            attach_reports, attach_succeeded = restore_files_via_attach(
+            attach_reports, partition_reattached = restore_files_via_attach(
                 ctx, attach_requests, excluded_parts
             )
             result.extend(attach_reports)
@@ -151,16 +142,32 @@ def restore_recoverable_broken_partitions(
         if detach_unrecoverable:
             result.append(detach_unrecoverable_partition(ctx, partition_info))
         elif reattach_unrecoverable:
-            if not attach_attempted:
-                attach_succeeded = detach_broken_partition(
-                    ctx, partition_info, reattach=True
+            if partition_reattached is None:
+                result.append(reattach_unrecoverable_partition(ctx, partition_info))
+            else:
+                result.append(
+                    make_partition_action_report(
+                        partition_info,
+                        reattach=True,
+                        success=partition_reattached,
+                    )
                 )
-            result.append(
-                make_partition_action_report(
-                    partition_info, reattach=True, success=attach_succeeded
-                )
-            )
 
+    return result
+
+
+def group_broken_parts_by_partition(
+    broken_parts: List[BrokenPart],
+) -> Dict[PartitionKey, List[BrokenPart]]:
+    result: Dict[PartitionKey, List[BrokenPart]] = {}
+    for broken_part in broken_parts:
+        part_info = broken_part.info
+        partition_key = PartitionKey(
+            database=part_info.database,
+            table=part_info.table,
+            partition_id=part_info.partition_id,
+        )
+        result.setdefault(partition_key, []).append(broken_part)
     return result
 
 
@@ -224,48 +231,12 @@ def restore_recoverable_broken_part(
         missing_by_file.setdefault(missing_object.filename, []).append(missing_object)
 
     supported_attach_files = {"checksums.txt", "columns.txt"}
-    if set(missing_by_file).issubset(supported_attach_files):
-        filenames = sorted(missing_by_file)
-        if all(
-            filename == "checksums.txt"
-            or (filename == "columns.txt" and can_restore_columns_txt(broken_part.info))
-            for filename in filenames
-        ):
-            return PartRecoveryResult(
-                part_info=broken_part.info,
-                reports=[],
-                attach_files=filenames,
-                has_unresolved=False,
-            )
-
-        for filename in filenames:
-            report.append(
-                make_restore_report(
-                    broken_part.info,
-                    filename,
-                    "unrecoverable",
-                    "columns.txt can be restored only for Wide parts",
-                )
-            )
-
-        return PartRecoveryResult(
-            part_info=broken_part.info,
-            reports=report,
-            attach_files=[],
-            has_unresolved=True,
-        )
+    attach_files = sorted(set(missing_by_file).intersection(supported_attach_files))
 
     for filename, missing_objects in sorted(missing_by_file.items()):
         if filename in supported_attach_files:
-            report.append(
-                make_restore_report(
-                    broken_part.info,
-                    filename,
-                    "skipped",
-                    "metadata restore via attach is skipped while other files are missing",
-                )
-            )
-        elif all(item.object_info.size == 0 for item in missing_objects):
+            continue
+        if all(item.object_info.size == 0 for item in missing_objects):
             report.extend(
                 restore_empty_objects(
                     broken_part.info, missing_objects, s3_client, bucket
@@ -306,10 +277,37 @@ def restore_recoverable_broken_part(
                 )
             )
 
+    if "columns.txt" in attach_files and not can_restore_columns_txt(broken_part.info):
+        for filename in attach_files:
+            report.append(
+                make_restore_report(
+                    broken_part.info,
+                    filename,
+                    "unrecoverable" if filename == "columns.txt" else "skipped",
+                    (
+                        "columns.txt can be restored only for Wide parts"
+                        if filename == "columns.txt"
+                        else "metadata restore via attach is skipped while columns.txt is unrecoverable"
+                    ),
+                )
+            )
+        attach_files = []
+    elif reports_have_unresolved(report):
+        for filename in attach_files:
+            report.append(
+                make_restore_report(
+                    broken_part.info,
+                    filename,
+                    "skipped",
+                    "metadata restore via attach is skipped while other files are missing",
+                )
+            )
+        attach_files = []
+
     return PartRecoveryResult(
         part_info=broken_part.info,
         reports=report,
-        attach_files=[],
+        attach_files=attach_files,
         has_unresolved=reports_have_unresolved(report),
     )
 
@@ -568,6 +566,13 @@ def detach_unrecoverable_partition(
 ) -> Dict[str, Any]:
     success = detach_broken_partition(ctx, part_info, reattach=False)
     return make_partition_action_report(part_info, reattach=False, success=success)
+
+
+def reattach_unrecoverable_partition(
+    ctx: Context, part_info: BrokenPartInfo
+) -> Dict[str, Any]:
+    success = detach_broken_partition(ctx, part_info, reattach=True)
+    return make_partition_action_report(part_info, reattach=True, success=success)
 
 
 def make_partition_action_report(
