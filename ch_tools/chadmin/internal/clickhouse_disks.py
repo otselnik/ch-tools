@@ -1,6 +1,5 @@
 import subprocess
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import xmltodict
 
@@ -24,44 +23,47 @@ def _quote_path(path: str) -> str:
     return f"'{path}'"
 
 
-@dataclass(frozen=True)
-class ClickHouseDiskResult:
-    stdout: bytes
-    stderr: bytes
-
-
 class ClickHouseDiskClient:
-    """Small non-interactive wrapper around clickhouse-disks."""
+    """Non-interactive wrapper around clickhouse-disks."""
 
     def __init__(
         self,
         disk: str,
         disk_config_path: Optional[str] = None,
+        *,
+        run_as_clickhouse: bool = True,
     ) -> None:
         self.disk = disk
-        self.disk_config_path = disk_config_path or make_ch_disks_config(disk)
+        self.run_as_clickhouse = run_as_clickhouse
+        self.disk_config_path = disk_config_path
+        if self.disk_config_path is None and run_as_clickhouse:
+            self.disk_config_path = make_ch_disks_config(disk)
 
-    def _run(
+    def _base_args(self) -> List[str]:
+        args = (
+            ["sudo", "-u", "clickhouse", "env", "HOME=/tmp"]
+            if self.run_as_clickhouse
+            else []
+        )
+        args.append("clickhouse-disks")
+        if self.disk_config_path:
+            args.extend(["-C", self.disk_config_path])
+        args.extend(["--disk", self.disk])
+        return args
+
+    def _execute(
         self,
-        command: str,
+        command_args: List[str],
+        *,
         stdin: Optional[bytes] = None,
-    ) -> ClickHouseDiskResult:
-        args = [
-            "sudo",
-            "-u",
-            "clickhouse",
-            "env",
-            "HOME=/tmp",
-            "clickhouse-disks",
-            "-C",
-            self.disk_config_path,
-            "--disk",
-            self.disk,
-            "--query",
-            command,
-        ]
+        check: bool = True,
+        dry_run: bool = False,
+    ) -> subprocess.CompletedProcess[bytes]:
+        args = [*self._base_args(), *command_args]
+        logging.info("Run: {}", args)
+        if dry_run:
+            return subprocess.CompletedProcess(args, 0, b"", b"")
 
-        logging.info("Run clickhouse-disks command: {}", command)
         proc = subprocess.run(
             args,
             input=stdin,
@@ -69,15 +71,18 @@ class ClickHouseDiskClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if proc.returncode:
+        if check and proc.returncode:
             raise RuntimeError(
                 f"clickhouse-disks command failed with code {proc.returncode}: "
                 f"{proc.stderr.decode(errors='replace')}"
             )
-        return ClickHouseDiskResult(proc.stdout, proc.stderr)
+        return proc
+
+    def _run(self, command: str, stdin: Optional[bytes] = None) -> bytes:
+        return self._execute(["--query", command], stdin=stdin).stdout
 
     def read(self, path: str) -> bytes:
-        return self._run(f"read {_quote_path(path)}").stdout
+        return self._run(f"read {_quote_path(path)}")
 
     def write(self, path: str, content: bytes) -> None:
         self._run(f"write {_quote_path(path)}", stdin=content)
@@ -89,9 +94,28 @@ class ClickHouseDiskClient:
         suffix = " --parents" if parents else ""
         self._run(f"mkdir {_quote_path(path)}{suffix}")
 
-    def remove(self, path: str, recursive: bool = False) -> None:
-        suffix = " --recursive" if recursive else ""
-        self._run(f"remove {_quote_path(path)}{suffix}")
+    def remove(
+        self,
+        path: str,
+        recursive: bool = False,
+        *,
+        ch_version: Optional[str] = None,
+        dry_run: bool = False,
+        check: bool = True,
+    ) -> Tuple[int, bytes]:
+        if ch_version is not None and not version_ge(ch_version, "24.7"):
+            command_args = ["remove", path]
+        else:
+            suffix = " --recursive" if recursive else ""
+            command_args = ["--query", f"remove {_quote_path(path)}{suffix}"]
+
+        proc = self._execute(command_args, check=check, dry_run=dry_run)
+        logging.info(
+            "clickhouse-disks remove command has finished: retcode {}, stderr: {}",
+            proc.returncode,
+            proc.stderr.decode(),
+        )
+        return (proc.returncode, proc.stderr)
 
 
 def make_ch_disks_config(disk: str) -> str:
@@ -118,35 +142,16 @@ def remove_from_ch_disk(
     disk_config_path: Optional[str] = None,
     dry_run: bool = False,
 ) -> Tuple[int, bytes]:
-    args = ["clickhouse-disks"]
-    if disk_config_path:
-        args.extend(["-C", disk_config_path])
-    args.extend(["--disk", disk])
-    if version_ge(ch_version, "24.7"):
-        args.extend(
-            [
-                "--query",
-                f"remove {_quote_path(path)} --recursive",
-            ]
-        )
-    else:
-        args.extend(["remove", path])
-
-    logging.info("Run: {}", args)
-
-    if dry_run:
-        return (0, b"")
-
-    proc = subprocess.run(
-        args,
+    """Compatibility wrapper for existing cleanup callers."""
+    client = ClickHouseDiskClient(
+        disk,
+        disk_config_path,
+        run_as_clickhouse=False,
+    )
+    return client.remove(
+        path,
+        recursive=True,
+        ch_version=ch_version,
+        dry_run=dry_run,
         check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
     )
-
-    logging.info(
-        "clickhouse-disks remove command has finished: retcode {}, stderr: {}",
-        proc.returncode,
-        proc.stderr.decode(),
-    )
-    return (proc.returncode, proc.stderr)

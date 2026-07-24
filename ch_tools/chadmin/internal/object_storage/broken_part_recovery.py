@@ -19,13 +19,14 @@ from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     get_object_storage_key,
     object_exists,
 )
+from ch_tools.chadmin.internal.part import attach_part, get_disks
 from ch_tools.chadmin.internal.system import get_version
 from ch_tools.chadmin.internal.table import check_table, delete_table
 from ch_tools.chadmin.internal.utils import execute_query
 from ch_tools.common import logging
 from ch_tools.common.clickhouse.config import get_clickhouse_config
 from ch_tools.common.clickhouse.config.storage_configuration import S3DiskConfiguration
-from ch_tools.common.utils import version_ge
+from ch_tools.common.utils import escape_for_file_name, version_ge
 
 # pylint: disable=too-many-lines
 
@@ -58,7 +59,6 @@ class TableRef:
 @dataclass(frozen=True)
 class SourceTable:
     ref: TableRef
-    engine: str
     storage_policy: str
     data_paths: List[str]
 
@@ -67,7 +67,6 @@ class SourceTable:
 class DiskInfo:
     name: str
     root: Path
-    type: str
 
 
 @dataclass(frozen=True)
@@ -75,15 +74,6 @@ class PartColumn:
     name: str
     type: str
     definition: str
-
-
-@dataclass
-class LogicalFile:
-    name: str
-    path: Path
-    intact: bool
-    missing_keys: List[str]
-    size: int
 
 
 @dataclass(frozen=True)
@@ -162,31 +152,52 @@ def parse_columns_text(value: str) -> List[PartColumn]:
     return result
 
 
-def _parse_column_definition(definition: str) -> Tuple[str, str]:
-    if not definition.startswith("`"):
-        raise ValueError(f"Invalid column definition: {definition}")
+def _parse_backquoted(value: str) -> Tuple[str, int]:
+    quote = chr(96)
+    if not value.startswith(quote):
+        raise ValueError(f"Expected backquoted value: {value}")
+
+    result: List[str] = []
     index = 1
-    name = []
-    while index < len(definition):
-        char = definition[index]
-        if char == "`":
-            if index + 1 < len(definition) and definition[index + 1] == "`":
-                name.append("`")
+    escapes = {
+        "0": "\0",
+        "a": "\a",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+    }
+    while index < len(value):
+        char = value[index]
+        if char == quote:
+            if index + 1 < len(value) and value[index + 1] == quote:
+                result.append(quote)
                 index += 2
                 continue
-            break
-        if char == "\\" and index + 1 < len(definition):
-            name.append(definition[index + 1])
+            return "".join(result), index + 1
+        if char == "\\":
+            if index + 1 >= len(value):
+                raise ValueError(f"Invalid escape in backquoted value: {value}")
+            escaped = value[index + 1]
+            result.append(escapes.get(escaped, escaped))
             index += 2
             continue
-        name.append(char)
+        result.append(char)
         index += 1
-    if index >= len(definition) or definition[index : index + 2] != "` ":
+
+    raise ValueError(f"Unterminated backquoted value: {value}")
+
+
+def _parse_column_definition(definition: str) -> Tuple[str, str]:
+    name, end = _parse_backquoted(definition)
+    if end >= len(definition) or definition[end] != " ":
         raise ValueError(f"Invalid column definition: {definition}")
-    type_name = definition[index + 2 :]
+    type_name = definition[end + 1 :]
     if not type_name:
         raise ValueError(f"Missing type in column definition: {definition}")
-    return "".join(name), type_name
+    return name, type_name
 
 
 def render_columns_text(columns: Iterable[PartColumn]) -> bytes:
@@ -214,13 +225,17 @@ def parse_columns_substreams(value: str) -> Dict[str, List[str]]:
     for _ in range(int(count_match.group(1))):
         if index >= len(lines):
             raise ValueError("Unexpected end of columns_substreams.txt")
-        header = re.fullmatch(
-            r"(\d+) substreams for column `((?:``|[^`])*)`:", lines[index]
-        )
+        header = re.fullmatch(r"(\d+) substreams for column (.+):", lines[index])
         if not header:
             raise ValueError(f"Invalid substreams header: {lines[index]}")
         index += 1
-        name = header.group(2).replace("``", "`")
+        quoted_name = header.group(2)
+        name, name_end = _parse_backquoted(quoted_name)
+        if name_end != len(quoted_name):
+            raise ValueError(f"Invalid substreams header: {lines[index - 1]}")
+        if name in result:
+            raise ValueError(f"Duplicate substreams metadata for column {name}")
+
         streams: List[str] = []
         for _ in range(int(header.group(1))):
             if index >= len(lines) or not lines[index].startswith("\t"):
@@ -232,6 +247,36 @@ def parse_columns_substreams(value: str) -> Dict[str, List[str]]:
     if index != len(lines):
         raise ValueError("Unexpected trailing data in columns_substreams.txt")
     return result
+
+
+def _has_valid_stream_prefix(stream: str, prefix: str) -> bool:
+    return (
+        stream == prefix
+        or stream.startswith(prefix + ".")
+        or stream.startswith(prefix + "%2E")
+    )
+
+
+def _validate_columns_substreams(
+    columns: List[PartColumn], substreams: Dict[str, List[str]]
+) -> None:
+    expected = [column.name for column in columns]
+    actual = list(substreams)
+    if actual != expected:
+        raise ValueError(
+            "columns_substreams.txt columns differ from columns.txt: "
+            f"expected {expected}, got {actual}"
+        )
+
+    for column in columns:
+        escaped = escape_for_file_name(column.name)
+        nested = escape_for_file_name(column.name.split(".", 1)[0])
+        for stream in substreams[column.name]:
+            if _has_valid_stream_prefix(stream, escaped) or _has_valid_stream_prefix(
+                stream, nested
+            ):
+                continue
+            raise ValueError(f"Invalid substream {stream} for column {column.name}")
 
 
 def render_columns_substreams(
@@ -325,7 +370,7 @@ def _list_merge_tree_tables(ctx: Context) -> List[SourceTable]:
     rows = execute_query(
         ctx,
         """
-        SELECT database, name, engine, storage_policy, data_paths
+        SELECT database, name, storage_policy, data_paths
         FROM system.tables
         WHERE engine LIKE '%MergeTree%'
         """,
@@ -334,7 +379,6 @@ def _list_merge_tree_tables(ctx: Context) -> List[SourceTable]:
     return [
         SourceTable(
             TableRef(row["database"], row["name"]),
-            row["engine"],
             row["storage_policy"],
             list(row["data_paths"]),
         )
@@ -387,7 +431,7 @@ def _infer_table_from_path(
     for source_table in tables:
         for data_path in source_table.data_paths:
             detached_root = Path(data_path).resolve() / "detached"
-            if _is_relative_to(path, detached_root):
+            if path.is_relative_to(detached_root):
                 matches.append(source_table.ref)
                 break
     unique_matches = set(matches)
@@ -397,15 +441,10 @@ def _infer_table_from_path(
 
 
 def _find_disk_for_path(ctx: Context, path: Path) -> DiskInfo:
-    rows = execute_query(
-        ctx,
-        "SELECT name, path, type FROM system.disks",
-        format_="JSON",
-    )["data"]
     disks = [
-        DiskInfo(row["name"], Path(row["path"]).resolve(), row["type"])
-        for row in rows
-        if _is_relative_to(path, Path(row["path"]).resolve())
+        DiskInfo(name, Path(info["path"]).resolve())
+        for name, info in get_disks(ctx).items()
+        if path.is_relative_to(Path(info["path"]).resolve())
     ]
     if not disks:
         raise ValueError(f"Part path is outside configured ClickHouse disks: {path}")
@@ -428,40 +467,28 @@ def _validate_policy_disk(ctx: Context, policy: str, disk: str) -> None:
         raise ValueError(f"Disk {disk} is not part of storage policy {policy}")
 
 
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
 def inspect_logical_files(
     source: RecoverySource,
     s3_client: Boto3Client,
     disk_conf: S3DiskConfiguration,
-) -> Dict[str, LogicalFile]:
-    result: Dict[str, LogicalFile] = {}
+) -> Dict[str, bool]:
+    result: Dict[str, bool] = {}
     for path in sorted(source.path.iterdir()):
         if not path.is_file():
             continue
-        missing_keys: List[str] = []
         try:
             metadata = S3ObjectLocalMetaData.from_file(path)
-            for object_info in metadata.objects:
-                key = get_object_storage_key(disk_conf.prefix, object_info)
-                if not object_exists(s3_client, disk_conf.bucket_name, key):
-                    missing_keys.append(key)
-            result[path.name] = LogicalFile(
-                path.name,
-                path,
-                not missing_keys,
-                missing_keys,
-                metadata.total_size,
+            result[path.name] = all(
+                object_exists(
+                    s3_client,
+                    disk_conf.bucket_name,
+                    get_object_storage_key(disk_conf.prefix, object_info),
+                )
+                for object_info in metadata.objects
             )
         except (OSError, ValueError) as e:
             logging.warning("Cannot parse metadata file {}: {!r}", path, e)
-            result[path.name] = LogicalFile(path.name, path, False, [], 0)
+            result[path.name] = False
     return result
 
 
@@ -469,7 +496,7 @@ def analyze_part(
     ctx: Context,
     disk_client: ClickHouseDiskClient,
     source: RecoverySource,
-    files: Dict[str, LogicalFile],
+    files: Dict[str, bool],
 ) -> RecoveryAnalysis:
     _require_intact(files, COLUMNS_FILE)
     _require_intact(files, COUNT_FILE)
@@ -483,6 +510,7 @@ def analyze_part(
         substreams = parse_columns_substreams(
             _read_source_file(disk_client, source, COLUMNS_SUBSTREAMS_FILE).decode()
         )
+        _validate_columns_substreams(columns, substreams)
 
     serialization = None
     if SERIALIZATION_FILE in files:
@@ -508,7 +536,7 @@ def analyze_part(
 
 def _analyze_compact(
     columns: List[PartColumn],
-    files: Dict[str, LogicalFile],
+    files: Dict[str, bool],
     rows: int,
     substreams: Optional[Dict[str, List[str]]],
     serialization: Optional[Dict[str, Any]],
@@ -519,7 +547,7 @@ def _analyze_compact(
         if name.startswith("data.mrk") or name.startswith("data.cmrk")
     )
     required = {"data.bin", *mark_files}
-    missing = sorted(name for name in required if not files[name].intact)
+    missing = sorted(name for name in required if not files.get(name, False))
     recovered = columns if not missing and mark_files else []
     lost = (
         {}
@@ -543,7 +571,7 @@ def _analyze_compact(
 def _analyze_wide(
     ctx: Context,
     columns: List[PartColumn],
-    files: Dict[str, LogicalFile],
+    files: Dict[str, bool],
     rows: int,
     substreams: Optional[Dict[str, List[str]]],
     serialization: Optional[Dict[str, Any]],
@@ -558,7 +586,7 @@ def _analyze_wide(
 def _analyze_wide_with_substreams(
     ctx: Context,
     columns: List[PartColumn],
-    files: Dict[str, LogicalFile],
+    files: Dict[str, bool],
     rows: int,
     substreams: Dict[str, List[str]],
     serialization: Optional[Dict[str, Any]],
@@ -589,12 +617,12 @@ def _analyze_wide_with_substreams(
                 continue
             data_file = base + ".bin"
             mark_files = _marks_for_base(base, files)
-            if data_file not in files or not files[data_file].intact:
+            if data_file not in files or not files[data_file]:
                 missing.append(data_file)
             if not mark_files:
                 missing.append(base + ".mrk*")
             else:
-                missing.extend(mark for mark in mark_files if not files[mark].intact)
+                missing.extend(mark for mark in mark_files if not files[mark])
             required.add(data_file)
             required.update(mark_files)
         if missing:
@@ -617,18 +645,18 @@ def _analyze_wide_with_substreams(
 
 def _analyze_legacy_wide(
     columns: List[PartColumn],
-    files: Dict[str, LogicalFile],
+    files: Dict[str, bool],
     rows: int,
     serialization: Optional[Dict[str, Any]],
 ) -> RecoveryAnalysis:
     data_files = [name for name in files if name.endswith(".bin")]
-    recovered: List[PartColumn] = []
-    lost: Dict[str, List[str]] = {}
-    copy_files: Set[str] = {COUNT_FILE}
+    bases_by_column: Dict[str, Set[str]] = {}
+    owner_groups_by_base: Dict[str, Set[str]] = {}
 
     for column in columns:
-        escaped = _escape_for_file_name(column.name)
-        nested = _escape_for_file_name(column.name.split(".", 1)[0])
+        escaped = escape_for_file_name(column.name)
+        owner_group = column.name.split(".", 1)[0]
+        nested = escape_for_file_name(owner_group)
         bases = {
             name[:-4]
             for name in data_files
@@ -644,12 +672,28 @@ def _analyze_legacy_wide(
             raise ValueError(
                 f"Cannot unambiguously map legacy streams for column {column.name}"
             )
+        bases_by_column[column.name] = bases
+        for base in bases:
+            owner_groups_by_base.setdefault(base, set()).add(owner_group)
 
+    ambiguous = sorted(
+        base for base, owners in owner_groups_by_base.items() if len(owners) > 1
+    )
+    if ambiguous:
+        raise ValueError(
+            "Legacy streams match unrelated columns: " + ", ".join(ambiguous)
+        )
+
+    recovered: List[PartColumn] = []
+    lost: Dict[str, List[str]] = {}
+    copy_files: Set[str] = {COUNT_FILE}
+    for column in columns:
+        bases = bases_by_column[column.name]
         required = {base + ".bin" for base in bases}
         for base in bases:
             required.update(_marks_for_base(base, files))
         missing = sorted(
-            name for name in required if name not in files or not files[name].intact
+            name for name in required if name not in files or not files.get(name, False)
         )
         if any(not _marks_for_base(base, files) for base in bases):
             missing.append("marks")
@@ -689,7 +733,7 @@ def _hash_stream_names(ctx: Context, streams: List[str]) -> List[str]:
 
 
 def _resolve_stream_base(
-    stream: str, stream_hash: str, files: Dict[str, LogicalFile]
+    stream: str, stream_hash: str, files: Dict[str, bool]
 ) -> Optional[str]:
     if stream + ".bin" in files or _marks_for_base(stream, files):
         return stream
@@ -698,7 +742,7 @@ def _resolve_stream_base(
     return None
 
 
-def _marks_for_base(base: str, files: Dict[str, LogicalFile]) -> List[str]:
+def _marks_for_base(base: str, files: Dict[str, bool]) -> List[str]:
     return sorted(
         name
         for name in files
@@ -706,19 +750,8 @@ def _marks_for_base(base: str, files: Dict[str, LogicalFile]) -> List[str]:
     )
 
 
-def _escape_for_file_name(value: str) -> str:
-    result = []
-    for byte in value.encode():
-        char = chr(byte)
-        if char.isascii() and (char.isalnum() or char == "_"):
-            result.append(char)
-        else:
-            result.append(f"%{byte:02X}")
-    return "".join(result)
-
-
-def _require_intact(files: Dict[str, LogicalFile], filename: str) -> None:
-    if filename not in files or not files[filename].intact:
+def _require_intact(files: Dict[str, bool], filename: str) -> None:
+    if filename not in files or not files[filename]:
         raise ValueError(f"Required structural file is not recoverable: {filename}")
 
 
@@ -784,10 +817,12 @@ def recover_part(
             ctx, disk_client, source, stage, analysis, files
         )
         logging.info("Prepared recovery staging part at {}", stage_part_path)
-        execute_query(
+        attach_part(
             ctx,
-            f"ALTER TABLE {stage.sql} ATTACH PART {quote_string(STAGING_PART_NAME)}",
-            format_=None,
+            stage.database,
+            stage.table,
+            STAGING_PART_NAME,
+            echo=False,
         )
         active_part = _get_only_active_part(ctx, stage)
         if not check_table(ctx, stage.database, stage.table, part=active_part):
@@ -901,7 +936,7 @@ def _prepare_staging_part(
     source: RecoverySource,
     stage: TableRef,
     analysis: RecoveryAnalysis,
-    files: Dict[str, LogicalFile],
+    files: Dict[str, bool],
 ) -> str:
     stage_root = _get_table_path_on_disk(ctx, stage, source.disk)
     relative_stage_root = str(stage_root.relative_to(source.disk.root))
@@ -951,7 +986,7 @@ def _get_table_path_on_disk(ctx: Context, table: TableRef, disk: DiskInfo) -> Pa
     paths = [
         Path(item).resolve()
         for item in rows[0][0]
-        if _is_relative_to(Path(item).resolve(), disk.root)
+        if Path(item).resolve().is_relative_to(disk.root)
     ]
     if len(paths) != 1:
         raise RuntimeError(

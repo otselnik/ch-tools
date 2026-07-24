@@ -288,13 +288,15 @@ def attach_part(
     table: str,
     part_name: str,
     dry_run: bool = False,
+    *,
+    echo: bool = True,
 ) -> None:
     """
     Attach the specified data part.
     """
     timeout = ctx.obj["config"]["clickhouse"]["alter_table_timeout"]
     query = f"ALTER TABLE `{database}`.`{table}` ATTACH PART '{part_name}'"
-    execute_query(ctx, query, timeout=timeout, format_=None, echo=True, dry_run=dry_run)
+    execute_query(ctx, query, timeout=timeout, format_=None, echo=echo, dry_run=dry_run)
 
 
 def detach_part(

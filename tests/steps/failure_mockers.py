@@ -30,9 +30,9 @@ def step_remove_keys_from_s3_for_partition(
                     context, node, get_parts_info_query, format_="JSONCompact"
                 )["data"][0][2]
                 keys_to_remove.append(
-                    get_s3_object_key_for_part_file(
+                    get_s3_object_keys_for_part_file(
                         context, node, part_local_path, "columns.txt"
-                    )
+                    )[0]
                 )
 
     s3_client = s3.S3Client(context)
@@ -65,22 +65,14 @@ def step_remove_file_blobs_from_detached_part(
         f"found {len(detached_parts)}"
     )
 
-    logical_path = os.path.join(detached_parts[0][0], filename)
-    escaped_path = logical_path.replace("\\", "\\\\").replace("'", "\\'")
-    remote_paths = execute_query(
+    remote_paths = get_s3_object_keys_for_part_file(
         context,
         node,
-        (
-            "SELECT remote_path FROM system.remote_data_paths "
-            "WHERE disk_name='object_storage' "
-            f"AND startsWith(concat(path, local_path), '{escaped_path}')"
-        ),
-        format_="JSONCompact",
-    )["data"]
-    assert remote_paths, f"No S3 blobs found for {logical_path}"
-
+        detached_parts[0][0],
+        filename,
+    )
     s3_client = s3.S3Client(context)
-    for remote_path in {row[0] for row in remote_paths}:
+    for remote_path in remote_paths:
         s3_client.delete_data(remote_path)
         assert not s3_client.path_exists(remote_path)
 
@@ -137,31 +129,32 @@ def remove_s3_object_for_active_part_file(
         )
     part_path = part_data[0][0]
 
-    object_key = get_s3_object_key_for_part_file(context, node, part_path, filename)
+    object_key = get_s3_object_keys_for_part_file(context, node, part_path, filename)[0]
 
     s3_client = s3.S3Client(context)
     s3_client.delete_data(object_key)
     assert not s3_client.path_exists(object_key)
 
 
-def get_s3_object_key_for_part_file(
+def get_s3_object_keys_for_part_file(
     context: ContextT, node: str, part_path: str, filename: str
-) -> str:
+) -> list[str]:
+    logical_path = os.path.join(part_path, filename)
+    escaped_path = logical_path.replace("\\", "\\\\").replace("'", "\\'")
     object_key_query = (
         "SELECT remote_path FROM system.remote_data_paths "
         "WHERE disk_name='object_storage' "
-        f"AND startsWith(concat(path, local_path), '{os.path.join(part_path, filename)}') "
-        "LIMIT 1"
+        f"AND startsWith(concat(path, local_path), '{escaped_path}')"
     )
     object_key_data = execute_query(
         context, node, object_key_query, format_="JSONCompact"
     )["data"]
     if not object_key_data:
         raise AssertionError(
-            f"No remote object path found for active part file {filename} "
-            f"at {part_path} on node {node}"
+            f"No remote object path found for part file {filename} "
+            f"at {part_path} on {node}"
         )
-    return object_key_data[0][0]
+    return sorted({row[0] for row in object_key_data})
 
 
 @when("we move parts as broken_on_start for table {database}.{table} on {node:w}")

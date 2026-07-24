@@ -12,7 +12,6 @@ from ch_tools.chadmin.internal.object_storage import broken_part_recovery as rec
 from ch_tools.chadmin.internal.object_storage.broken_part_recovery import (
     COUNT_FILE,
     DiskInfo,
-    LogicalFile,
     PartColumn,
     SourceTable,
     TableRef,
@@ -24,8 +23,8 @@ from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
 )
 
 
-def logical_file(name: str, intact: bool = True) -> LogicalFile:
-    return LogicalFile(name, Path(name), intact, [], 1)
+def logical_file(_name: str, intact: bool = True) -> bool:
+    return intact
 
 
 def test_columns_round_trip() -> None:
@@ -81,6 +80,60 @@ def test_columns_substreams_round_trip_and_filter_serialization() -> None:
     }
 
 
+def test_columns_parsers_accept_clickhouse_backslash_escapes() -> None:
+    quote = chr(96)
+    columns = recovery.parse_columns_text(
+        "columns format version: 1\n"
+        "1 columns:\n"
+        f"{quote}a\\{quote}b{quote} String\n"
+    )
+    substreams = recovery.parse_columns_substreams(
+        "columns substreams version: 1\n"
+        "1 columns:\n"
+        f"1 substreams for column {quote}a\\{quote}b{quote}:\n"
+        "\ta%60b\n"
+    )
+
+    assert columns[0].name == f"a{quote}b"
+    assert list(substreams) == [f"a{quote}b"]
+    recovery._validate_columns_substreams(columns, substreams)
+
+
+def test_columns_substreams_reject_duplicate_columns() -> None:
+    quote = chr(96)
+    value = (
+        "columns substreams version: 1\n"
+        "2 columns:\n"
+        f"1 substreams for column {quote}a{quote}:\n"
+        "\ta\n"
+        f"1 substreams for column {quote}a{quote}:\n"
+        "\ta\n"
+    )
+
+    with pytest.raises(ValueError, match="Duplicate substreams metadata"):
+        recovery.parse_columns_substreams(value)
+
+
+@pytest.mark.parametrize(
+    "substreams,error",
+    [
+        ({"b": ["b"], "a": ["a"]}, "columns differ"),
+        ({"a": ["other"], "b": ["b"]}, "Invalid substream"),
+    ],
+)
+def test_columns_substreams_validate_order_and_prefix(
+    substreams: dict[str, list[str]], error: str
+) -> None:
+    quote = chr(96)
+    columns = [
+        PartColumn("a", "UInt64", f"{quote}a{quote} UInt64"),
+        PartColumn("b", "UInt64", f"{quote}b{quote} UInt64"),
+    ]
+
+    with pytest.raises(ValueError, match=error):
+        recovery._validate_columns_substreams(columns, substreams)
+
+
 def test_compact_part_is_only_recoverable_as_a_whole() -> None:
     columns = [
         PartColumn("a", "UInt64", "`a` UInt64"),
@@ -96,10 +149,25 @@ def test_compact_part_is_only_recoverable_as_a_whole() -> None:
     assert intact.recovered_columns == columns
     assert intact.files_to_copy == {COUNT_FILE, "data.bin", "data.mrk3"}
 
-    files["data.bin"].intact = False
+    files["data.bin"] = False
     broken = recovery._analyze_compact(columns, files, 12, None, None)
     assert not broken.recovered_columns
     assert set(broken.lost_files_by_column) == {"a", "b"}
+
+
+def test_legacy_wide_part_uses_intact_column_streams() -> None:
+    quote = chr(96)
+    columns = [PartColumn("value", "UInt64", f"{quote}value{quote} UInt64")]
+    files = {
+        COUNT_FILE: True,
+        "value.bin": True,
+        "value.mrk2": True,
+    }
+
+    analysis = recovery._analyze_legacy_wide(columns, files, 3, None)
+
+    assert analysis.recovered_columns == columns
+    assert analysis.files_to_copy == {COUNT_FILE, "value.bin", "value.mrk2"}
 
 
 @patch(
@@ -145,7 +213,6 @@ def test_path_infers_table_from_detached_data_path(
     part_path.mkdir(parents=True)
     table = SourceTable(
         TableRef("db", "source"),
-        "MergeTree",
         "s3",
         [str(table_root)],
     )
@@ -178,13 +245,12 @@ def test_explicit_table_is_fallback_when_path_cannot_be_inferred(
     part_path.mkdir()
     source_table = SourceTable(
         TableRef("db", "source"),
-        "MergeTree",
         "s3",
         [str(tmp_path / "unrelated")],
     )
     list_tables.return_value = [source_table]
     infer_table.return_value = None
-    find_disk.return_value = DiskInfo("s3", tmp_path, "s3")
+    find_disk.return_value = DiskInfo("s3", tmp_path)
 
     source = recovery.resolve_recovery_source(
         MagicMock(), "db", "source", None, str(part_path)
@@ -286,6 +352,32 @@ def test_clickhouse_disks_copy_and_recursive_remove_use_query_interface(
     ]
 
 
+@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
+@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
+def test_clickhouse_disks_remove_supports_legacy_interface(
+    run: MagicMock,
+    _logging: MagicMock,
+) -> None:
+    run.return_value = MagicMock(returncode=7, stdout=b"", stderr=b"failed")
+    client = ClickHouseDiskClient("s3", run_as_clickhouse=False)
+
+    result = client.remove(
+        "legacy/path",
+        recursive=True,
+        ch_version="24.6",
+        check=False,
+    )
+
+    assert result == (7, b"failed")
+    assert run.call_args.args[0] == [
+        "clickhouse-disks",
+        "--disk",
+        "s3",
+        "remove",
+        "legacy/path",
+    ]
+
+
 def test_recover_part_rejects_unsupported_clickhouse_before_source_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -306,11 +398,10 @@ def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     source = recovery.RecoverySource(
         SourceTable(
             TableRef("source_db", "source"),
-            "MergeTree",
             "s3",
             ["/disk/source"],
         ),
-        DiskInfo("s3", Path("/disk"), "s3"),
+        DiskInfo("s3", Path("/disk")),
         Path("/disk/source/detached/part"),
         "source/detached/part",
         "part",
