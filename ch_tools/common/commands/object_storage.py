@@ -24,6 +24,7 @@ from ch_tools.chadmin.internal.object_storage.s3_iterator import (
 from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     S3ObjectLocalInfo,
     S3ObjectLocalMetaData,
+    get_object_storage_key,
 )
 from ch_tools.chadmin.internal.process import kill_process
 from ch_tools.chadmin.internal.system import match_ch_backup_version, match_ch_version
@@ -1040,7 +1041,7 @@ def _insert_local_blobs_batch(
     Insert batch of object names to the listing table.
     """
     batch_values = ",".join(
-        f"('{replica}','{item.key if item.key_is_full else os.path.join(disk_conf.prefix, item.key)}','{state}',{item.size},1)"
+        f"('{replica}','{get_object_storage_key(disk_conf.prefix, item)}','{state}',{item.size},1)"
         for item in obj_paths_batch
     )
     execute_query(
