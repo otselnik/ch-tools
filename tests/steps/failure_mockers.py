@@ -29,16 +29,94 @@ def step_remove_keys_from_s3_for_partition(
                 part_local_path = execute_query(
                     context, node, get_parts_info_query, format_="JSONCompact"
                 )["data"][0][2]
-                # For this part, get the single object key in s3.
-                get_object_key_query = f"SELECT concat(path, local_path) AS full_path, remote_path from system.remote_data_paths  WHERE disk_name='object_storage'  and startsWith(full_path, '{os.path.join(part_local_path, 'columns.txt')}')"
-                data_object_key = execute_query(
-                    context, node, get_object_key_query, format_="JSONCompact"
-                )["data"][0][1]
-                keys_to_remove.append(data_object_key)
+                keys_to_remove.append(
+                    get_s3_object_key_for_part_file(
+                        context, node, part_local_path, "columns.txt"
+                    )
+                )
 
     s3_client = s3.S3Client(context)
     for key in keys_to_remove:
         s3_client.delete_data(key)
+
+
+@when(
+    "we remove s3 object for active part file {filename} from table {database}.{table} on {node:w}"
+)
+def step_remove_s3_object_for_active_part_file(
+    context: ContextT, filename: str, database: str, table: str, node: str
+) -> None:
+    remove_s3_object_for_active_part_file(
+        context, filename, database, table, node, part_index=0
+    )
+
+
+@when(
+    "we remove s3 object for active part {part_index:d} file {filename} "
+    "from table {database}.{table} on {node:w}"
+)
+def step_remove_s3_object_for_selected_active_part_file(
+    context: ContextT,
+    part_index: int,
+    filename: str,
+    database: str,
+    table: str,
+    node: str,
+) -> None:
+    remove_s3_object_for_active_part_file(
+        context, filename, database, table, node, part_index
+    )
+
+
+def remove_s3_object_for_active_part_file(
+    context: ContextT,
+    filename: str,
+    database: str,
+    table: str,
+    node: str,
+    part_index: int,
+) -> None:
+    part_path_query = (
+        "SELECT path FROM system.parts "
+        f"WHERE database='{database}' AND table='{table}' AND active "
+        f"ORDER BY name LIMIT 1 OFFSET {part_index}"
+    )
+    part_data = execute_query(context, node, part_path_query, format_="JSONCompact")[
+        "data"
+    ]
+    if not part_data:
+        raise AssertionError(
+            f"No active part {part_index} found for table {database}.{table} "
+            f"on node {node} "
+            f"when trying to remove S3 object for file {filename}"
+        )
+    part_path = part_data[0][0]
+
+    object_key = get_s3_object_key_for_part_file(context, node, part_path, filename)
+
+    s3_client = s3.S3Client(context)
+    s3_client.delete_data(object_key)
+    assert not s3_client.path_exists(object_key)
+
+
+def get_s3_object_key_for_part_file(
+    context: ContextT, node: str, part_path: str, filename: str
+) -> str:
+    object_key_query = (
+        "SELECT remote_path FROM system.remote_data_paths "
+        "WHERE disk_name='object_storage' "
+        f"AND startsWith(concat(path, local_path), '{os.path.join(part_path, filename)}') "
+        "LIMIT 1"
+    )
+    object_key_data = execute_query(
+        context, node, object_key_query, format_="JSONCompact"
+    )["data"]
+    if not object_key_data:
+        raise AssertionError(
+            f"No remote object path found for active part file {filename} "
+            f"at {part_path} on node {node}"
+        )
+    return object_key_data[0][0]
 
 
 @when("we move parts as broken_on_start for table {database}.{table} on {node:w}")

@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,3 +110,9 @@ class S3ObjectLocalMetaData:
         Whether key also contains object storage prefix or not.
         """
         return self._version_with_full_object_key(self.version)
+
+
+def get_object_storage_key(prefix: str, s3_object: S3ObjectLocalInfo) -> str:
+    if s3_object.key_is_full:
+        return s3_object.key
+    return os.path.join(prefix, s3_object.key)
