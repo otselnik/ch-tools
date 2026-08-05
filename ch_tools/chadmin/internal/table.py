@@ -95,6 +95,7 @@ def list_tables(
                 t.uuid,
                 t.metadata_modification_time,
                 t.engine,
+                t.storage_policy,
                 t.data_paths,
                 t.metadata_path,
                 t.create_table_query
@@ -154,6 +155,7 @@ def list_tables(
             t.name,
             t.uuid,
             t.engine,
+            t.storage_policy,
             t.create_table_query,
             t.metadata_path,
             t.metadata_modification_time,

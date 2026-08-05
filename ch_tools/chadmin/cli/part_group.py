@@ -690,7 +690,7 @@ def remove_detached_part_prefix_command(
     "--path",
     "part_path",
     type=Path(exists=True, file_okay=False, path_type=str),
-    help="Absolute path to a detached part.",
+    help="Absolute path to a detached S3 part.",
 )
 @option(
     "--target-table",
@@ -706,7 +706,7 @@ def recover_part_command(
     part_path: Optional[str],
     target_table: str,
 ) -> None:
-    """Recover intact data from a broken detached object-storage part.
+    """Recover intact data from a broken detached S3 part.
 
     Requires ClickHouse 25.8 or above.
     """

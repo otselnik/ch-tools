@@ -11,6 +11,7 @@ Feature: Recover data from broken detached object-storage parts
     """
     DROP DATABASE IF EXISTS recovery_source;
     DROP DATABASE IF EXISTS recovered_by_path;
+    DROP DATABASE IF EXISTS recovered_by_name;
     DROP DATABASE IF EXISTS recovered_by_table;
 
     CREATE DATABASE recovery_source;
@@ -82,6 +83,29 @@ Feature: Recover data from broken detached object-storage parts
 
     When we execute command on clickhouse01
     """
+    PART_NAME=$(clickhouse client --query "
+        SELECT name
+        FROM system.detached_parts
+        WHERE database = 'recovery_source' AND table = 'source'
+    ")
+    chadmin part recover --database recovery_source --table source --name "$PART_NAME" --target-table recovered_by_name.data
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT id, keep
+    FROM recovered_by_name.data
+    ORDER BY id
+    """
+    Then we get query response
+    """
+    1\tone
+    2\ttwo
+    3\tthree
+    """
+
+    When we execute command on clickhouse01
+    """
     PART_PATH=$(clickhouse client --query "
         SELECT path
         FROM system.detached_parts
@@ -108,6 +132,53 @@ Feature: Recover data from broken detached object-storage parts
     1\tone
     2\ttwo
     3\tthree
+    """
+
+  @require_version_25.8
+  Scenario: Recover a Compact part with broken regenerable metadata
+    When we execute queries on clickhouse01
+    """
+    DROP DATABASE IF EXISTS compact_recovery_source;
+    DROP DATABASE IF EXISTS recovered_compact;
+
+    CREATE DATABASE compact_recovery_source;
+    CREATE TABLE compact_recovery_source.source
+    (
+        id UInt64,
+        value String
+    )
+    ENGINE = MergeTree
+    ORDER BY tuple()
+    SETTINGS
+        storage_policy = 'object_storage',
+        min_bytes_for_wide_part = 1000000000,
+        min_rows_for_wide_part = 1000000000;
+
+    INSERT INTO compact_recovery_source.source VALUES
+        (1, 'one'),
+        (2, 'two');
+
+    ALTER TABLE compact_recovery_source.source DETACH PARTITION tuple();
+    """
+    And we remove S3 blobs for file checksums.txt from detached part compact_recovery_source.source on clickhouse01
+
+    When we execute command on clickhouse01
+    """
+    PART_NAME=$(clickhouse client --query "
+        SELECT name FROM system.detached_parts
+        WHERE database = 'compact_recovery_source' AND table = 'source'
+    ")
+    chadmin part recover --database compact_recovery_source --table source --name "$PART_NAME" --target-table recovered_compact.data
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT id, value FROM recovered_compact.data ORDER BY id
+    """
+    Then we get query response
+    """
+    1\tone
+    2\ttwo
     """
 
   @require_version_less_than_25.8

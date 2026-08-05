@@ -23,6 +23,11 @@ def _quote_path(path: str) -> str:
     return f"'{path}'"
 
 
+def _query_has_error(stderr: bytes) -> bool:
+    """Detect command errors hidden by the clickhouse-disks query interface."""
+    return any(line.startswith(b"Error:") for line in stderr.splitlines())
+
+
 class ClickHouseDiskClient:
     """Non-interactive wrapper around clickhouse-disks."""
 
@@ -71,6 +76,13 @@ class ClickHouseDiskClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        if proc.returncode == 0 and _query_has_error(proc.stderr):
+            proc = subprocess.CompletedProcess(
+                proc.args,
+                1,
+                proc.stdout,
+                proc.stderr,
+            )
         if check and proc.returncode:
             raise RuntimeError(
                 f"clickhouse-disks command failed with code {proc.returncode}: "

@@ -4,9 +4,10 @@ import json
 import os
 import re
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Generator, List, Optional, Set
 
 import boto3
 from boto3 import client as Boto3Client
@@ -14,28 +15,45 @@ from botocore.client import Config
 from click import Context
 
 from ch_tools.chadmin.internal.clickhouse_disks import ClickHouseDiskClient
+from ch_tools.chadmin.internal.object_storage.part_recovery_metadata import (
+    ROW_EXISTS_COLUMN,
+    PartColumn,
+    RecoveryAnalysis,
+    _validate_columns_substreams,
+    filter_serialization,
+    parse_columns_substreams,
+    parse_columns_text,
+    render_columns_substreams,
+    render_columns_text,
+)
 from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     S3ObjectLocalMetaData,
     get_object_storage_key,
     object_exists,
 )
-from ch_tools.chadmin.internal.part import attach_part, get_disks
+from ch_tools.chadmin.internal.part import (
+    attach_part,
+    get_disks,
+    list_detached_parts,
+    list_parts,
+)
 from ch_tools.chadmin.internal.system import get_version
-from ch_tools.chadmin.internal.table import check_table, delete_table
+from ch_tools.chadmin.internal.table import (
+    check_table,
+    delete_table,
+    list_tables,
+    table_exists,
+)
 from ch_tools.chadmin.internal.utils import execute_query
 from ch_tools.common import logging
 from ch_tools.common.clickhouse.config import get_clickhouse_config
 from ch_tools.common.clickhouse.config.storage_configuration import S3DiskConfiguration
 from ch_tools.common.utils import escape_for_file_name, version_ge
 
-# pylint: disable=too-many-lines
-
-
 COLUMNS_FILE = "columns.txt"
 COLUMNS_SUBSTREAMS_FILE = "columns_substreams.txt"
 COUNT_FILE = "count.txt"
 SERIALIZATION_FILE = "serialization.json"
-ROW_EXISTS_COLUMN = "_row_exists"
 RECOVERY_ROW_EXISTS_COLUMN = "_recovery_row_exists"
 STAGING_PART_NAME = "all_0_0_0"
 MIN_CLICKHOUSE_VERSION = "25.8"
@@ -70,45 +88,12 @@ class DiskInfo:
 
 
 @dataclass(frozen=True)
-class PartColumn:
-    name: str
-    type: str
-    definition: str
-
-
-@dataclass(frozen=True)
 class RecoverySource:
     table: SourceTable
     disk: DiskInfo
     path: Path
     relative_path: str
     part_name: str
-
-
-@dataclass
-class RecoveryAnalysis:
-    part_type: str
-    columns: List[PartColumn]
-    recovered_columns: List[PartColumn]
-    lost_files_by_column: Dict[str, List[str]]
-    files_to_copy: Set[str]
-    rows: int
-    columns_substreams: Optional[Dict[str, List[str]]]
-    serialization: Optional[Dict[str, Any]]
-
-    @property
-    def recovered_user_columns(self) -> List[PartColumn]:
-        return [
-            column
-            for column in self.recovered_columns
-            if column.name != ROW_EXISTS_COLUMN
-        ]
-
-    @property
-    def has_row_exists(self) -> bool:
-        return any(
-            column.name == ROW_EXISTS_COLUMN for column in self.recovered_columns
-        )
 
 
 def quote_identifier(value: str) -> str:
@@ -126,187 +111,6 @@ def parse_qualified_table(value: str) -> TableRef:
     if not database or not table:
         raise ValueError("Target table must be specified as DATABASE.TABLE")
     return TableRef(database, table)
-
-
-def parse_columns_text(value: str) -> List[PartColumn]:
-    lines = value.splitlines()
-    if len(lines) < 2 or lines[0] != "columns format version: 1":
-        raise ValueError("Unsupported columns.txt format")
-
-    count_match = re.fullmatch(r"(\d+) columns:", lines[1])
-    if not count_match:
-        raise ValueError("Invalid columns.txt header")
-    count = int(count_match.group(1))
-    definitions = lines[2:]
-    while definitions and not definitions[-1]:
-        definitions.pop()
-    if len(definitions) != count:
-        raise ValueError(
-            f"columns.txt declares {count} columns but contains {len(definitions)}"
-        )
-
-    result: List[PartColumn] = []
-    for definition in definitions:
-        name, type_name = _parse_column_definition(definition)
-        result.append(PartColumn(name, type_name, definition))
-    return result
-
-
-def _parse_backquoted(value: str) -> Tuple[str, int]:
-    quote = chr(96)
-    if not value.startswith(quote):
-        raise ValueError(f"Expected backquoted value: {value}")
-
-    result: List[str] = []
-    index = 1
-    escapes = {
-        "0": "\0",
-        "a": "\a",
-        "b": "\b",
-        "f": "\f",
-        "n": "\n",
-        "r": "\r",
-        "t": "\t",
-        "v": "\v",
-    }
-    while index < len(value):
-        char = value[index]
-        if char == quote:
-            if index + 1 < len(value) and value[index + 1] == quote:
-                result.append(quote)
-                index += 2
-                continue
-            return "".join(result), index + 1
-        if char == "\\":
-            if index + 1 >= len(value):
-                raise ValueError(f"Invalid escape in backquoted value: {value}")
-            escaped = value[index + 1]
-            result.append(escapes.get(escaped, escaped))
-            index += 2
-            continue
-        result.append(char)
-        index += 1
-
-    raise ValueError(f"Unterminated backquoted value: {value}")
-
-
-def _parse_column_definition(definition: str) -> Tuple[str, str]:
-    name, end = _parse_backquoted(definition)
-    if end >= len(definition) or definition[end] != " ":
-        raise ValueError(f"Invalid column definition: {definition}")
-    type_name = definition[end + 1 :]
-    if not type_name:
-        raise ValueError(f"Missing type in column definition: {definition}")
-    return name, type_name
-
-
-def render_columns_text(columns: Iterable[PartColumn]) -> bytes:
-    column_list = list(columns)
-    lines = [
-        "columns format version: 1",
-        f"{len(column_list)} columns:",
-        *(column.definition for column in column_list),
-    ]
-    return ("\n".join(lines) + "\n").encode()
-
-
-def parse_columns_substreams(value: str) -> Dict[str, List[str]]:
-    lines = value.splitlines()
-    while lines and not lines[-1]:
-        lines.pop()
-    if len(lines) < 2 or lines[0] != "columns substreams version: 1":
-        raise ValueError("Unsupported columns_substreams.txt format")
-    count_match = re.fullmatch(r"(\d+) columns:", lines[1])
-    if not count_match:
-        raise ValueError("Invalid columns_substreams.txt header")
-
-    result: Dict[str, List[str]] = {}
-    index = 2
-    for _ in range(int(count_match.group(1))):
-        if index >= len(lines):
-            raise ValueError("Unexpected end of columns_substreams.txt")
-        header = re.fullmatch(r"(\d+) substreams for column (.+):", lines[index])
-        if not header:
-            raise ValueError(f"Invalid substreams header: {lines[index]}")
-        index += 1
-        quoted_name = header.group(2)
-        name, name_end = _parse_backquoted(quoted_name)
-        if name_end != len(quoted_name):
-            raise ValueError(f"Invalid substreams header: {lines[index - 1]}")
-        if name in result:
-            raise ValueError(f"Duplicate substreams metadata for column {name}")
-
-        streams: List[str] = []
-        for _ in range(int(header.group(1))):
-            if index >= len(lines) or not lines[index].startswith("\t"):
-                raise ValueError("Invalid substream entry")
-            streams.append(lines[index][1:])
-            index += 1
-        result[name] = streams
-
-    if index != len(lines):
-        raise ValueError("Unexpected trailing data in columns_substreams.txt")
-    return result
-
-
-def _has_valid_stream_prefix(stream: str, prefix: str) -> bool:
-    return (
-        stream == prefix
-        or stream.startswith(prefix + ".")
-        or stream.startswith(prefix + "%2E")
-    )
-
-
-def _validate_columns_substreams(
-    columns: List[PartColumn], substreams: Dict[str, List[str]]
-) -> None:
-    expected = [column.name for column in columns]
-    actual = list(substreams)
-    if actual != expected:
-        raise ValueError(
-            "columns_substreams.txt columns differ from columns.txt: "
-            f"expected {expected}, got {actual}"
-        )
-
-    for column in columns:
-        escaped = escape_for_file_name(column.name)
-        nested = escape_for_file_name(column.name.split(".", 1)[0])
-        for stream in substreams[column.name]:
-            if _has_valid_stream_prefix(stream, escaped) or _has_valid_stream_prefix(
-                stream, nested
-            ):
-                continue
-            raise ValueError(f"Invalid substream {stream} for column {column.name}")
-
-
-def render_columns_substreams(
-    substreams: Dict[str, List[str]], columns: Iterable[PartColumn]
-) -> bytes:
-    column_list = list(columns)
-    lines = [
-        "columns substreams version: 1",
-        f"{len(column_list)} columns:",
-    ]
-    for column in column_list:
-        column_streams = substreams.get(column.name)
-        if not column_streams:
-            raise ValueError(f"No substreams found for column {column.name}")
-        escaped_name = column.name.replace("`", "``")
-        lines.append(f"{len(column_streams)} substreams for column `{escaped_name}`:")
-        lines.extend(f"\t{stream}" for stream in column_streams)
-    return ("\n".join(lines) + "\n").encode()
-
-
-def filter_serialization(
-    serialization: Dict[str, Any], columns: Iterable[PartColumn]
-) -> bytes:
-    names = {column.name for column in columns}
-    result = dict(serialization)
-    if "columns" in result:
-        result["columns"] = [
-            item for item in result["columns"] if item.get("name") in names
-        ]
-    return json.dumps(result, separators=(",", ":")).encode()
 
 
 def resolve_recovery_source(
@@ -367,39 +171,31 @@ def resolve_recovery_source(
 
 
 def _list_merge_tree_tables(ctx: Context) -> List[SourceTable]:
-    rows = execute_query(
-        ctx,
-        """
-        SELECT database, name, storage_policy, data_paths
-        FROM system.tables
-        WHERE engine LIKE '%MergeTree%'
-        """,
-        format_="JSON",
-    )["data"]
     return [
         SourceTable(
             TableRef(row["database"], row["name"]),
             row["storage_policy"],
             list(row["data_paths"]),
         )
-        for row in rows
+        for row in list_tables(ctx, engine_pattern="%MergeTree%")
     ]
 
 
 def _find_detached_part(
     ctx: Context, table: TableRef, part_name: str
 ) -> Dict[str, Any]:
-    rows = execute_query(
-        ctx,
-        f"""
-        SELECT database, table, name, path, disk
-        FROM system.detached_parts
-        WHERE database = {quote_string(table.database)}
-          AND table = {quote_string(table.table)}
-          AND name = {quote_string(part_name)}
-        """,
-        format_="JSON",
-    )["data"]
+    rows = [
+        row
+        for row in list_detached_parts(
+            ctx,
+            database=table.database,
+            table=table.table,
+            part_name=part_name,
+        )
+        if row["database"] == table.database
+        and row["table"] == table.table
+        and row["name"] == part_name
+    ]
     if len(rows) != 1:
         raise ValueError(
             f"Expected one detached part {table.display}.{part_name}, found {len(rows)}"
@@ -761,6 +557,46 @@ def _read_source_file(
     return disk_client.read(os.path.join(source.relative_path, filename))
 
 
+def _get_s3_disk_configuration(ctx: Context, disk_name: str) -> S3DiskConfiguration:
+    ch_config = get_clickhouse_config(ctx)
+    disk_config = ch_config.storage_configuration.get_disk_config(disk_name)
+    disk_type = disk_config.get("object_storage_type", disk_config.get("type"))
+    if disk_type != S3DiskConfiguration.OBJECT_STORAGE_TYPE:
+        raise ValueError(
+            f"Part recovery supports only S3 disks; disk {disk_name} has type {disk_type}"
+        )
+    return S3DiskConfiguration.from_config(
+        ch_config.storage_configuration,
+        disk_name,
+        ctx.obj["config"]["object_storage"]["bucket_name_prefix"],
+    )
+
+
+@contextmanager
+def _temporary_recovery_table(
+    ctx: Context,
+    table: TableRef,
+    columns: List[PartColumn],
+    storage_policy: str,
+) -> Generator[None, None, None]:
+    failure: Optional[BaseException] = None
+    try:
+        _create_recovery_table(ctx, table, columns, storage_policy)
+        yield
+    except BaseException as e:
+        failure = e
+        raise
+    finally:
+        try:
+            delete_table(ctx, table.database, table.table)
+        except Exception:
+            if failure is None:
+                raise
+            logging.exception(
+                "Failed to clean up temporary recovery table {}", table.display
+            )
+
+
 def recover_part(
     ctx: Context,
     database: Optional[str],
@@ -779,12 +615,7 @@ def recover_part(
     source = resolve_recovery_source(ctx, database, table, part_name, part_path)
     _assert_target_absent(ctx, target)
 
-    ch_config = get_clickhouse_config(ctx)
-    disk_conf = S3DiskConfiguration.from_config(
-        ch_config.storage_configuration,
-        source.disk.name,
-        ctx.obj["config"]["object_storage"]["bucket_name_prefix"],
-    )
+    disk_conf = _get_s3_disk_configuration(ctx, source.disk.name)
     s3_client = boto3.client(
         "s3",
         endpoint_url=disk_conf.endpoint_url,
@@ -804,100 +635,90 @@ def recover_part(
         f"_chadmin_recover_{uuid.uuid4().hex}",
     )
     target_created = False
-    stage_created = False
+    stage_columns = [
+        column for column in analysis.columns if column.name != ROW_EXISTS_COLUMN
+    ]
     try:
-        _create_recovery_table(
-            ctx,
-            stage,
-            [column for column in analysis.columns if column.name != ROW_EXISTS_COLUMN],
-            source.table.storage_policy,
-        )
-        stage_created = True
-        stage_part_path = _prepare_staging_part(
-            ctx, disk_client, source, stage, analysis, files
-        )
-        logging.info("Prepared recovery staging part at {}", stage_part_path)
-        attach_part(
-            ctx,
-            stage.database,
-            stage.table,
-            STAGING_PART_NAME,
-            echo=False,
-        )
-        active_part = _get_only_active_part(ctx, stage)
-        if not check_table(ctx, stage.database, stage.table, part=active_part):
-            raise RuntimeError("CHECK TABLE failed for the staging part")
-
-        mask_settings = (
-            " SETTINGS apply_deleted_mask = 0" if analysis.has_row_exists else ""
-        )
-        physical_rows = int(
-            execute_query(
+        with _temporary_recovery_table(
+            ctx, stage, stage_columns, source.table.storage_policy
+        ):
+            stage_part_path = _prepare_staging_part(
+                ctx, disk_client, source, stage, analysis, files
+            )
+            logging.info("Prepared recovery staging part at {}", stage_part_path)
+            attach_part(
                 ctx,
-                f"SELECT count() FROM {stage.sql}{mask_settings}",
-                format_=None,
+                stage.database,
+                stage.table,
+                STAGING_PART_NAME,
+                echo=False,
             )
-        )
-        if physical_rows != analysis.rows:
-            raise RuntimeError(
-                f"Staging row count differs: expected {analysis.rows}, got {physical_rows}"
-            )
+            active_part = _get_only_active_part(ctx, stage)
+            if not check_table(ctx, stage.database, stage.table, part=active_part):
+                raise RuntimeError("CHECK TABLE failed for the staging part")
 
-        execute_query(
-            ctx,
-            f"CREATE DATABASE IF NOT EXISTS {quote_identifier(target.database)}",
-            format_=None,
-        )
-        target_columns = list(analysis.recovered_user_columns)
-        if analysis.has_row_exists:
-            target_columns.append(
-                PartColumn(
-                    RECOVERY_ROW_EXISTS_COLUMN,
-                    "UInt8",
-                    f"{quote_identifier(RECOVERY_ROW_EXISTS_COLUMN)} UInt8",
+            mask_settings = (
+                " SETTINGS apply_deleted_mask = 0" if analysis.has_row_exists else ""
+            )
+            physical_rows = int(
+                execute_query(
+                    ctx,
+                    f"SELECT count() FROM {stage.sql}{mask_settings}",
+                    format_=None,
                 )
             )
-        _create_recovery_table(
-            ctx,
-            target,
-            target_columns,
-            source.table.storage_policy,
-        )
-        target_created = True
-        _insert_recovered_data(ctx, stage, target, analysis)
+            if physical_rows != analysis.rows:
+                raise RuntimeError(
+                    f"Staging row count differs: expected {analysis.rows}, got {physical_rows}"
+                )
 
-        target_rows = int(
-            execute_query(ctx, f"SELECT count() FROM {target.sql}", format_=None)
-        )
-        if target_rows != analysis.rows:
-            raise RuntimeError(
-                f"Target row count differs: expected {analysis.rows}, got {target_rows}"
+            execute_query(
+                ctx,
+                f"CREATE DATABASE IF NOT EXISTS {quote_identifier(target.database)}",
+                format_=None,
             )
-        if not check_table(ctx, target.database, target.table):
-            raise RuntimeError("CHECK TABLE failed for the recovery target")
-        return _make_report(source, target, analysis)
-    except Exception:
+            target_columns = list(analysis.recovered_user_columns)
+            if analysis.has_row_exists:
+                target_columns.append(
+                    PartColumn(
+                        RECOVERY_ROW_EXISTS_COLUMN,
+                        "UInt8",
+                        f"{quote_identifier(RECOVERY_ROW_EXISTS_COLUMN)} UInt8",
+                    )
+                )
+            _create_recovery_table(
+                ctx,
+                target,
+                target_columns,
+                source.table.storage_policy,
+            )
+            target_created = True
+            _insert_recovered_data(ctx, stage, target, analysis)
+
+            target_rows = int(
+                execute_query(ctx, f"SELECT count() FROM {target.sql}", format_=None)
+            )
+            if target_rows != analysis.rows:
+                raise RuntimeError(
+                    f"Target row count differs: expected {analysis.rows}, got {target_rows}"
+                )
+            if not check_table(ctx, target.database, target.table):
+                raise RuntimeError("CHECK TABLE failed for the recovery target")
+            return _make_report(source, target, analysis)
+    except BaseException:
         if target_created:
-            delete_table(ctx, target.database, target.table)
+            try:
+                delete_table(ctx, target.database, target.table)
+            except Exception:
+                logging.exception(
+                    "Failed to clean up incomplete recovery target {}",
+                    target.display,
+                )
         raise
-    finally:
-        if stage_created:
-            delete_table(ctx, stage.database, stage.table)
 
 
 def _assert_target_absent(ctx: Context, target: TableRef) -> None:
-    rows = execute_query(
-        ctx,
-        f"""
-        SELECT 1
-        FROM system.tables
-        WHERE database = {quote_string(target.database)}
-          AND name = {quote_string(target.table)}
-        LIMIT 1
-        """,
-        format_="JSONCompact",
-    )["data"]
-    if rows:
+    if table_exists(ctx, target.database, target.table):
         raise ValueError(f"Target table already exists: {target.display}")
 
 
@@ -996,22 +817,21 @@ def _get_table_path_on_disk(ctx: Context, table: TableRef, disk: DiskInfo) -> Pa
 
 
 def _get_only_active_part(ctx: Context, table: TableRef) -> str:
-    rows = execute_query(
-        ctx,
-        f"""
-        SELECT name
-        FROM system.parts
-        WHERE database = {quote_string(table.database)}
-          AND table = {quote_string(table.table)}
-          AND active
-        """,
-        format_="JSONCompact",
-    )["data"]
+    rows = [
+        row
+        for row in list_parts(
+            ctx,
+            database=table.database,
+            table=table.table,
+            active=True,
+        )
+        if row["database"] == table.database and row["table"] == table.table
+    ]
     if len(rows) != 1:
         raise RuntimeError(
             f"Expected one active staging part for {table.display}, found {len(rows)}"
         )
-    return str(rows[0][0])
+    return str(rows[0]["name"])
 
 
 def _insert_recovered_data(

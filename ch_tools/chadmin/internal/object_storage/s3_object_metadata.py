@@ -118,7 +118,12 @@ def get_object_storage_key(prefix: str, object_info: S3ObjectLocalInfo) -> str:
     """Return an object key with the configured disk prefix applied."""
     if object_info.key_is_full:
         return object_info.key
-    return "/".join((prefix.rstrip("/"), object_info.key.lstrip("/")))
+
+    normalized_prefix = prefix.rstrip("/")
+    normalized_key = object_info.key.lstrip("/")
+    if not normalized_prefix:
+        return normalized_key
+    return f"{normalized_prefix}/{normalized_key}"
 
 
 def object_exists(s3_client: Boto3Client, bucket: str, key: str) -> bool:

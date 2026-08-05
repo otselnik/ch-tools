@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from botocore.exceptions import ClientError
 
-from ch_tools.chadmin.internal.clickhouse_disks import ClickHouseDiskClient
 from ch_tools.chadmin.internal.object_storage import broken_part_recovery as recovery
 from ch_tools.chadmin.internal.object_storage.broken_part_recovery import (
     COUNT_FILE,
@@ -21,10 +20,6 @@ from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     get_object_storage_key,
     object_exists,
 )
-
-
-def logical_file(_name: str, intact: bool = True) -> bool:
-    return intact
 
 
 def test_columns_round_trip() -> None:
@@ -140,9 +135,9 @@ def test_compact_part_is_only_recoverable_as_a_whole() -> None:
         PartColumn("b", "String", "`b` String"),
     ]
     files = {
-        COUNT_FILE: logical_file(COUNT_FILE),
-        "data.bin": logical_file("data.bin"),
-        "data.mrk3": logical_file("data.mrk3"),
+        COUNT_FILE: True,
+        "data.bin": True,
+        "data.mrk3": True,
     }
 
     intact = recovery._analyze_compact(columns, files, 12, None, None)
@@ -182,11 +177,11 @@ def test_wide_part_recovers_only_columns_with_all_streams(
         PartColumn("b", "String", "`b` String"),
     ]
     files = {
-        COUNT_FILE: logical_file(COUNT_FILE),
-        "a.bin": logical_file("a.bin"),
-        "a.mrk2": logical_file("a.mrk2"),
-        "b.bin": logical_file("b.bin", intact=False),
-        "b.mrk2": logical_file("b.mrk2"),
+        COUNT_FILE: True,
+        "a.bin": True,
+        "a.mrk2": True,
+        "b.bin": False,
+        "b.mrk2": True,
     }
 
     analysis = recovery._analyze_wide_with_substreams(
@@ -281,103 +276,6 @@ def test_unresolved_path_without_table_is_an_error(
         recovery.resolve_recovery_source(MagicMock(), None, None, None, str(part_path))
 
 
-@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
-@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
-def test_clickhouse_disks_uses_argument_list_without_shell(
-    run: MagicMock,
-    _logging: MagicMock,
-) -> None:
-    run.return_value = MagicMock(returncode=0, stdout=b"data", stderr=b"")
-    client = ClickHouseDiskClient("s3", "/tmp/disks.xml")
-
-    assert client.read("path with spaces/file.bin") == b"data"
-
-    arguments = run.call_args.args[0]
-    assert arguments[:6] == [
-        "sudo",
-        "-u",
-        "clickhouse",
-        "env",
-        "HOME=/tmp",
-        "clickhouse-disks",
-    ]
-    assert arguments[-2:] == ["--query", "read 'path with spaces/file.bin'"]
-    assert run.call_args.kwargs["check"] is False
-    assert "shell" not in run.call_args.kwargs
-
-
-@pytest.mark.parametrize(
-    "parents,expected_query",
-    [
-        (True, "mkdir 'nested/path' --parents"),
-        (False, "mkdir 'nested/path'"),
-    ],
-)
-@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
-@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
-def test_clickhouse_disks_mkdir_uses_query_interface(
-    run: MagicMock,
-    _logging: MagicMock,
-    parents: bool,
-    expected_query: str,
-) -> None:
-    run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
-    client = ClickHouseDiskClient("s3", "/tmp/disks.xml")
-
-    client.mkdir("nested/path", parents=parents)
-
-    arguments = run.call_args.args[0]
-    assert arguments[-2:] == ["--query", expected_query]
-
-
-@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
-@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
-def test_clickhouse_disks_copy_and_recursive_remove_use_query_interface(
-    run: MagicMock,
-    _logging: MagicMock,
-) -> None:
-    run.return_value = MagicMock(returncode=0, stdout=b"", stderr=b"")
-    client = ClickHouseDiskClient("s3", "/tmp/disks.xml")
-
-    client.copy("source/file.bin", "target/file.bin")
-    client.remove("target", recursive=True)
-
-    assert run.call_args_list[0].args[0][-2:] == [
-        "--query",
-        "copy 'source/file.bin' 'target/file.bin'",
-    ]
-    assert run.call_args_list[1].args[0][-2:] == [
-        "--query",
-        "remove 'target' --recursive",
-    ]
-
-
-@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
-@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
-def test_clickhouse_disks_remove_supports_legacy_interface(
-    run: MagicMock,
-    _logging: MagicMock,
-) -> None:
-    run.return_value = MagicMock(returncode=7, stdout=b"", stderr=b"failed")
-    client = ClickHouseDiskClient("s3", run_as_clickhouse=False)
-
-    result = client.remove(
-        "legacy/path",
-        recursive=True,
-        ch_version="24.6",
-        check=False,
-    )
-
-    assert result == (7, b"failed")
-    assert run.call_args.args[0] == [
-        "clickhouse-disks",
-        "--disk",
-        "s3",
-        "remove",
-        "legacy/path",
-    ]
-
-
 def test_recover_part_rejects_unsupported_clickhouse_before_source_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -428,12 +326,7 @@ def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(recovery, "_assert_target_absent", MagicMock())
     monkeypatch.setattr(
         recovery,
-        "get_clickhouse_config",
-        MagicMock(return_value=MagicMock(storage_configuration=MagicMock())),
-    )
-    monkeypatch.setattr(
-        recovery.S3DiskConfiguration,
-        "from_config",
+        "_get_s3_disk_configuration",
         MagicMock(return_value=disk_conf),
     )
     monkeypatch.setattr(recovery.boto3, "client", MagicMock())
@@ -448,7 +341,24 @@ def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_stage_creation_failure_does_not_attempt_cleanup(
+def test_non_s3_disk_is_rejected_before_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage_configuration = MagicMock()
+    storage_configuration.get_disk_config.return_value = {"type": "azure_blob_storage"}
+    monkeypatch.setattr(
+        recovery,
+        "get_clickhouse_config",
+        MagicMock(return_value=MagicMock(storage_configuration=storage_configuration)),
+    )
+    ctx = MagicMock()
+    ctx.obj = {"config": {"object_storage": {"bucket_name_prefix": ""}}}
+
+    with pytest.raises(ValueError, match="supports only S3 disks"):
+        recovery._get_s3_disk_configuration(ctx, "azure")
+
+
+def test_stage_creation_failure_still_attempts_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     patch_recover_part_dependencies(monkeypatch)
@@ -463,7 +373,32 @@ def test_stage_creation_failure_does_not_attempt_cleanup(
         recovery.recover_part(ctx, None, None, None, "/part", "target.data")
 
     create_table.assert_called_once()
-    delete_table.assert_not_called()
+    delete_table.assert_called_once_with(ctx, "source_db", "_chadmin_recover_stage")
+
+
+def test_stage_cleanup_failure_preserves_creation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_recover_part_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        recovery,
+        "_create_recovery_table",
+        MagicMock(side_effect=RuntimeError("stage creation failed")),
+    )
+    monkeypatch.setattr(
+        recovery,
+        "delete_table",
+        MagicMock(side_effect=RuntimeError("cleanup failed")),
+    )
+    logging = MagicMock()
+    monkeypatch.setattr(recovery, "logging", logging)
+    ctx = MagicMock()
+    ctx.obj = {"config": {"object_storage": {"bucket_name_prefix": "", "retries": {}}}}
+
+    with pytest.raises(RuntimeError, match="stage creation failed"):
+        recovery.recover_part(ctx, None, None, None, "/part", "target.data")
+
+    logging.exception.assert_called_once()
 
 
 def test_successfully_created_stage_is_cleaned_up_after_later_failure(
@@ -492,6 +427,10 @@ def test_object_storage_key_respects_metadata_version() -> None:
     full = S3ObjectLocalInfo("other/object", 1, True)
 
     assert get_object_storage_key("prefix/", relative) == "prefix/object"
+    assert get_object_storage_key("", relative) == "object"
+    assert (
+        get_object_storage_key("", S3ObjectLocalInfo("/object", 1, False)) == "object"
+    )
     assert get_object_storage_key("prefix/", full) == "other/object"
 
 

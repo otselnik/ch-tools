@@ -8,6 +8,7 @@ class TableInfo(TypedDict):
     name: str
     uuid: str
     engine: str
+    storage_policy: str
     create_table_query: str
     metadata_path: str
     metadata_modification_time: str
