@@ -401,9 +401,9 @@ def _get_disks_data(ctx: Context) -> Dict[str, str]:
 
 def _is_should_use_ch_disk_remover(table_data_path: str, disk_type: str) -> bool:
     if disk_type == DISK_LOCAL_KEY:
-        return os.path.exists(CLICKHOUSE_PATH + table_data_path)
+        return os.path.exists(os.path.join(CLICKHOUSE_PATH, table_data_path))
     if disk_type == DISK_OBJECT_STORAGE_KEY:
-        return os.path.exists(S3_PATH + table_data_path)
+        return os.path.exists(os.path.join(S3_PATH, table_data_path))
 
     return True
 
@@ -426,12 +426,15 @@ def _remove_table_data_from_disk(
         table_data_path,
     )
 
-    disk_config_path = make_ch_disks_config(disk_name)
-
     if not _is_should_use_ch_disk_remover(table_data_path, disk_type):
         logging.warning(
-            f"Dir {table_data_path} doesn't exist on disk {disk_name}. Skip launch clickhouse-disks for Clickhouse 22.8."
+            "Dir {} doesn't exist on disk {}. Skip launch clickhouse-disks.",
+            table_data_path,
+            disk_name,
         )
+        return
+
+    disk_config_path = make_ch_disks_config(disk_name)
 
     code, stderr = remove_from_ch_disk(
         disk=disk_name,
