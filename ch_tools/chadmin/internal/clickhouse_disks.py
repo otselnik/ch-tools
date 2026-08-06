@@ -1,3 +1,5 @@
+"""Helpers for executing non-interactive operations with ``clickhouse-disks``."""
+
 import subprocess
 from typing import List, Optional, Tuple
 

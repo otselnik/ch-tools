@@ -2,16 +2,23 @@
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from botocore.exceptions import ClientError
 
 from ch_tools.chadmin.internal.object_storage import broken_part_recovery as recovery
-from ch_tools.chadmin.internal.object_storage.broken_part_recovery import (
-    COUNT_FILE,
-    DiskInfo,
+from ch_tools.chadmin.internal.object_storage import part_recovery_metadata as metadata
+from ch_tools.chadmin.internal.object_storage import (
+    part_recovery_source as recovery_source,
+)
+from ch_tools.chadmin.internal.object_storage.broken_part_recovery import COUNT_FILE
+from ch_tools.chadmin.internal.object_storage.part_recovery_metadata import (
     PartColumn,
+    RecoveryAnalysis,
+)
+from ch_tools.chadmin.internal.object_storage.part_recovery_source import (
+    DiskInfo,
     SourceTable,
     TableRef,
 )
@@ -30,14 +37,14 @@ def test_columns_round_trip() -> None:
         "`payload` Nullable(String)\n"
     )
 
-    columns = recovery.parse_columns_text(value)
+    columns = metadata.parse_columns_text(value)
 
     assert [(column.name, column.type) for column in columns] == [
         ("a`b", "UInt64"),
         ("payload", "Nullable(String)"),
     ]
-    assert recovery.render_columns_text(columns) == value.encode()
-    assert recovery.parse_columns_text(value + "\n\n") == columns
+    assert metadata.render_columns_text(columns) == value.encode()
+    assert metadata.parse_columns_text(value + "\n\n") == columns
 
 
 def test_columns_substreams_round_trip_and_filter_serialization() -> None:
@@ -55,11 +62,11 @@ def test_columns_substreams_round_trip_and_filter_serialization() -> None:
         PartColumn("payload", "Nullable(String)", "`payload` Nullable(String)"),
     ]
 
-    substreams = recovery.parse_columns_substreams(value)
+    substreams = metadata.parse_columns_substreams(value)
 
-    assert recovery.render_columns_substreams(substreams, columns) == value.encode()
-    assert recovery.parse_columns_substreams(value + "\n") == substreams
-    serialized = recovery.filter_serialization(
+    assert metadata.render_columns_substreams(substreams, columns) == value.encode()
+    assert metadata.parse_columns_substreams(value + "\n") == substreams
+    serialized = metadata.filter_serialization(
         {
             "columns": [
                 {"name": "a", "kind": "Default"},
@@ -77,12 +84,12 @@ def test_columns_substreams_round_trip_and_filter_serialization() -> None:
 
 def test_columns_parsers_accept_clickhouse_backslash_escapes() -> None:
     quote = chr(96)
-    columns = recovery.parse_columns_text(
+    columns = metadata.parse_columns_text(
         "columns format version: 1\n"
         "1 columns:\n"
         f"{quote}a\\{quote}b{quote} String\n"
     )
-    substreams = recovery.parse_columns_substreams(
+    substreams = metadata.parse_columns_substreams(
         "columns substreams version: 1\n"
         "1 columns:\n"
         f"1 substreams for column {quote}a\\{quote}b{quote}:\n"
@@ -91,7 +98,7 @@ def test_columns_parsers_accept_clickhouse_backslash_escapes() -> None:
 
     assert columns[0].name == f"a{quote}b"
     assert list(substreams) == [f"a{quote}b"]
-    recovery._validate_columns_substreams(columns, substreams)
+    metadata.validate_columns_substreams(columns, substreams)
 
 
 def test_columns_substreams_reject_duplicate_columns() -> None:
@@ -106,7 +113,7 @@ def test_columns_substreams_reject_duplicate_columns() -> None:
     )
 
     with pytest.raises(ValueError, match="Duplicate substreams metadata"):
-        recovery.parse_columns_substreams(value)
+        metadata.parse_columns_substreams(value)
 
 
 @pytest.mark.parametrize(
@@ -126,7 +133,7 @@ def test_columns_substreams_validate_order_and_prefix(
     ]
 
     with pytest.raises(ValueError, match=error):
-        recovery._validate_columns_substreams(columns, substreams)
+        metadata.validate_columns_substreams(columns, substreams)
 
 
 def test_compact_part_is_only_recoverable_as_a_whole() -> None:
@@ -198,7 +205,7 @@ def test_wide_part_recovers_only_columns_with_all_streams(
     assert analysis.lost_files_by_column == {"b": ["b.bin"]}
 
 
-@patch("ch_tools.chadmin.internal.object_storage.broken_part_recovery.execute_query")
+@patch("ch_tools.chadmin.internal.object_storage.part_recovery_source.execute_query")
 def test_path_infers_table_from_detached_data_path(
     execute_query: MagicMock, tmp_path: Path
 ) -> None:
@@ -212,22 +219,22 @@ def test_path_infers_table_from_detached_data_path(
         [str(table_root)],
     )
 
-    assert recovery._infer_table_from_path(MagicMock(), part_path, [table]) == TableRef(
-        "db", "source"
-    )
+    assert recovery_source._infer_table_from_path(
+        MagicMock(), part_path, [table]
+    ) == TableRef("db", "source")
 
 
 @patch(
-    "ch_tools.chadmin.internal.object_storage.broken_part_recovery._validate_policy_disk"
+    "ch_tools.chadmin.internal.object_storage.part_recovery_source._validate_policy_disk"
 )
 @patch(
-    "ch_tools.chadmin.internal.object_storage.broken_part_recovery._find_disk_for_path"
+    "ch_tools.chadmin.internal.object_storage.part_recovery_source._find_disk_for_path"
 )
 @patch(
-    "ch_tools.chadmin.internal.object_storage.broken_part_recovery._infer_table_from_path"
+    "ch_tools.chadmin.internal.object_storage.part_recovery_source._infer_table_from_path"
 )
 @patch(
-    "ch_tools.chadmin.internal.object_storage.broken_part_recovery._list_merge_tree_tables"
+    "ch_tools.chadmin.internal.object_storage.part_recovery_source._list_merge_tree_tables"
 )
 def test_explicit_table_is_fallback_when_path_cannot_be_inferred(
     list_tables: MagicMock,
@@ -247,7 +254,7 @@ def test_explicit_table_is_fallback_when_path_cannot_be_inferred(
     infer_table.return_value = None
     find_disk.return_value = DiskInfo("s3", tmp_path)
 
-    source = recovery.resolve_recovery_source(
+    source = recovery_source.resolve_recovery_source(
         MagicMock(), "db", "source", None, str(part_path)
     )
 
@@ -257,10 +264,10 @@ def test_explicit_table_is_fallback_when_path_cannot_be_inferred(
 
 
 @patch(
-    "ch_tools.chadmin.internal.object_storage.broken_part_recovery._infer_table_from_path"
+    "ch_tools.chadmin.internal.object_storage.part_recovery_source._infer_table_from_path"
 )
 @patch(
-    "ch_tools.chadmin.internal.object_storage.broken_part_recovery._list_merge_tree_tables"
+    "ch_tools.chadmin.internal.object_storage.part_recovery_source._list_merge_tree_tables"
 )
 def test_unresolved_path_without_table_is_an_error(
     list_tables: MagicMock,
@@ -273,7 +280,9 @@ def test_unresolved_path_without_table_is_an_error(
     infer_table.return_value = None
 
     with pytest.raises(ValueError, match="Cannot infer source table"):
-        recovery.resolve_recovery_source(MagicMock(), None, None, None, str(part_path))
+        recovery_source.resolve_recovery_source(
+            MagicMock(), None, None, None, str(part_path)
+        )
 
 
 def test_recover_part_rejects_unsupported_clickhouse_before_source_resolution(
@@ -305,7 +314,7 @@ def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         "part",
     )
     column = PartColumn("value", "UInt64", "`value` UInt64")
-    analysis = recovery.RecoveryAnalysis(
+    analysis = RecoveryAnalysis(
         "Wide",
         [column],
         [column],
@@ -332,13 +341,27 @@ def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(recovery.boto3, "client", MagicMock())
     monkeypatch.setattr(recovery, "ClickHouseDiskClient", MagicMock())
     monkeypatch.setattr(recovery, "get_version", MagicMock(return_value="25.8"))
-    monkeypatch.setattr(recovery, "inspect_logical_files", MagicMock(return_value={}))
-    monkeypatch.setattr(recovery, "analyze_part", MagicMock(return_value=analysis))
+    monkeypatch.setattr(
+        recovery, "inspect_file_recoverability", MagicMock(return_value={})
+    )
+    monkeypatch.setattr(recovery, "_analyze_part", MagicMock(return_value=analysis))
     monkeypatch.setattr(
         recovery.uuid,
         "uuid4",
         MagicMock(return_value=MagicMock(hex="stage")),
     )
+
+
+def test_missing_target_uses_generated_table_in_source_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_recover_part_dependencies(monkeypatch)
+    ctx = MagicMock()
+    ctx.obj = {"config": {"object_storage": {"bucket_name_prefix": "", "retries": {}}}}
+
+    plan = recovery._prepare_recovery(ctx, None, None, None, "/part", None)
+
+    assert plan.target == TableRef("source_db", "_chadmin_recovered_stage")
 
 
 def test_non_s3_disk_is_rejected_before_recovery(
@@ -420,6 +443,42 @@ def test_successfully_created_stage_is_cleaned_up_after_later_failure(
         recovery.recover_part(ctx, None, None, None, "/part", "target.data")
 
     delete_table.assert_called_once_with(ctx, "source_db", "_chadmin_recover_stage")
+
+
+def test_incomplete_target_is_removed_before_staging_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_recover_part_dependencies(monkeypatch)
+    create_table = MagicMock()
+    delete_table = MagicMock()
+    monkeypatch.setattr(recovery, "_create_recovery_table", create_table)
+    monkeypatch.setattr(
+        recovery,
+        "_insert_recovered_data",
+        MagicMock(side_effect=RuntimeError("insert failed")),
+    )
+    monkeypatch.setattr(recovery, "delete_table", delete_table)
+    monkeypatch.setattr(recovery, "_prepare_staging_part", MagicMock())
+    monkeypatch.setattr(recovery, "attach_part", MagicMock())
+    monkeypatch.setattr(
+        recovery,
+        "_get_only_active_part",
+        MagicMock(return_value="all_1_1_0"),
+    )
+    monkeypatch.setattr(recovery, "check_table", MagicMock(return_value=True))
+    monkeypatch.setattr(recovery, "execute_query", MagicMock(return_value="1"))
+    monkeypatch.setattr(recovery, "logging", MagicMock())
+    ctx = MagicMock()
+    ctx.obj = {"config": {"object_storage": {"bucket_name_prefix": "", "retries": {}}}}
+
+    with pytest.raises(RuntimeError, match="insert failed"):
+        recovery.recover_part(ctx, None, None, None, "/part", "target.data")
+
+    assert create_table.call_count == 2
+    assert delete_table.call_args_list == [
+        call(ctx, "target", "data"),
+        call(ctx, "source_db", "_chadmin_recover_stage"),
+    ]
 
 
 def test_object_storage_key_respects_metadata_version() -> None:

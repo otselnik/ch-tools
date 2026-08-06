@@ -694,8 +694,10 @@ def remove_detached_part_prefix_command(
 )
 @option(
     "--target-table",
-    required=True,
-    help="New recovery table in DATABASE.TABLE form.",
+    help=(
+        "New recovery table in DATABASE.TABLE form. By default, creates "
+        "SOURCE_DATABASE._chadmin_recovered_UUID."
+    ),
 )
 @pass_context
 def recover_part_command(
@@ -704,7 +706,7 @@ def recover_part_command(
     table: Optional[str],
     part_name: Optional[str],
     part_path: Optional[str],
-    target_table: str,
+    target_table: Optional[str],
 ) -> None:
     """Recover intact data from a broken detached S3 part.
 

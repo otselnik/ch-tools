@@ -134,6 +134,32 @@ Feature: Recover data from broken detached object-storage parts
     3\tthree
     """
 
+    When we execute command on clickhouse01
+    """
+    DISK_PATH=$(clickhouse client --query "
+        SELECT path FROM system.disks WHERE name = 'object_storage'
+    ")
+    RECOVERY_PATH="${DISK_PATH%/}/recovery-input/broken_part"
+    chadmin --format yaml part recover --path "$RECOVERY_PATH" --database recovery_source --table source
+    """
+    Then we get response contains
+    """
+    target_table: recovery_source._chadmin_recovered_
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT id, keep
+    FROM merge('recovery_source', '^_chadmin_recovered_')
+    ORDER BY id
+    """
+    Then we get query response
+    """
+    1\tone
+    2\ttwo
+    3\tthree
+    """
+
   @require_version_25.8
   Scenario: Recover a Compact part with broken regenerable metadata
     When we execute queries on clickhouse01

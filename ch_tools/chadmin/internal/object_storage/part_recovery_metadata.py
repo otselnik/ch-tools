@@ -1,3 +1,5 @@
+"""Parse and render ClickHouse part metadata used during data recovery."""
+
 import json
 import re
 from dataclasses import dataclass
@@ -10,6 +12,14 @@ ROW_EXISTS_COLUMN = "_row_exists"
 
 @dataclass(frozen=True)
 class PartColumn:
+    """Column metadata preserved from ``columns.txt``.
+
+    Attributes:
+        name: Unescaped ClickHouse column name.
+        type: ClickHouse type expression.
+        definition: Original column definition used to rebuild ``columns.txt``.
+    """
+
     name: str
     type: str
     definition: str
@@ -17,6 +27,19 @@ class PartColumn:
 
 @dataclass
 class RecoveryAnalysis:
+    """Result of checking which columns can be recovered from a broken part.
+
+    Attributes:
+        part_type: ClickHouse part layout, either Compact or Wide.
+        columns: All columns declared by the source part.
+        recovered_columns: Columns whose data streams are complete.
+        lost_files_by_column: Missing or damaged streams for each lost column.
+        files_to_copy: Source files required to build the staging part.
+        rows: Physical row count recorded in ``count.txt``.
+        columns_substreams: Parsed modern substream metadata when available.
+        serialization: Parsed serialization metadata when available.
+    """
+
     part_type: str
     columns: List[PartColumn]
     recovered_columns: List[PartColumn]
@@ -42,6 +65,7 @@ class RecoveryAnalysis:
 
 
 def parse_columns_text(value: str) -> List[PartColumn]:
+    """Parse a version 1 ``columns.txt`` file and validate its column count."""
     lines = value.splitlines()
     if len(lines) < 2 or lines[0] != "columns format version: 1":
         raise ValueError("Unsupported columns.txt format")
@@ -51,6 +75,7 @@ def parse_columns_text(value: str) -> List[PartColumn]:
         raise ValueError("Invalid columns.txt header")
     count = int(count_match.group(1))
     definitions = lines[2:]
+    # ClickHouse metadata may contain more than one trailing newline.
     while definitions and not definitions[-1]:
         definitions.pop()
     if len(definitions) != count:
@@ -66,6 +91,7 @@ def parse_columns_text(value: str) -> List[PartColumn]:
 
 
 def _parse_backquoted(value: str) -> Tuple[str, int]:
+    """Parse one ClickHouse backquoted identifier and return its end offset."""
     quote = chr(96)
     if not value.startswith(quote):
         raise ValueError(f"Expected backquoted value: {value}")
@@ -104,6 +130,7 @@ def _parse_backquoted(value: str) -> Tuple[str, int]:
 
 
 def _parse_column_definition(definition: str) -> Tuple[str, str]:
+    """Split a ``columns.txt`` definition into its name and type."""
     name, end = _parse_backquoted(definition)
     if end >= len(definition) or definition[end] != " ":
         raise ValueError(f"Invalid column definition: {definition}")
@@ -114,6 +141,7 @@ def _parse_column_definition(definition: str) -> Tuple[str, str]:
 
 
 def render_columns_text(columns: Iterable[PartColumn]) -> bytes:
+    """Render columns in ClickHouse ``columns.txt`` version 1 format."""
     column_list = list(columns)
     lines = [
         "columns format version: 1",
@@ -124,7 +152,9 @@ def render_columns_text(columns: Iterable[PartColumn]) -> bytes:
 
 
 def parse_columns_substreams(value: str) -> Dict[str, List[str]]:
+    """Parse version 1 ``columns_substreams.txt`` into streams by column."""
     lines = value.splitlines()
+    # Ignore blank lines after the declared metadata, but reject other trailing data.
     while lines and not lines[-1]:
         lines.pop()
     if len(lines) < 2 or lines[0] != "columns substreams version: 1":
@@ -135,6 +165,7 @@ def parse_columns_substreams(value: str) -> Dict[str, List[str]]:
 
     result: Dict[str, List[str]] = {}
     index = 2
+    # Each declared column owns a header followed by its declared stream entries.
     for _ in range(int(count_match.group(1))):
         if index >= len(lines):
             raise ValueError("Unexpected end of columns_substreams.txt")
@@ -157,6 +188,7 @@ def parse_columns_substreams(value: str) -> Dict[str, List[str]]:
             index += 1
         result[name] = streams
 
+    # Consuming exactly all lines catches undeclared column or stream metadata.
     if index != len(lines):
         raise ValueError("Unexpected trailing data in columns_substreams.txt")
     return result
@@ -170,9 +202,10 @@ def _has_valid_stream_prefix(stream: str, prefix: str) -> bool:
     )
 
 
-def _validate_columns_substreams(
+def validate_columns_substreams(
     columns: List[PartColumn], substreams: Dict[str, List[str]]
 ) -> None:
+    """Validate that substreams match ``columns.txt`` order and file prefixes."""
     expected = [column.name for column in columns]
     actual = list(substreams)
     if actual != expected:
@@ -195,6 +228,7 @@ def _validate_columns_substreams(
 def render_columns_substreams(
     substreams: Dict[str, List[str]], columns: Iterable[PartColumn]
 ) -> bytes:
+    """Render selected columns and their streams in ClickHouse metadata format."""
     column_list = list(columns)
     lines = [
         "columns substreams version: 1",
@@ -213,6 +247,7 @@ def render_columns_substreams(
 def filter_serialization(
     serialization: Dict[str, Any], columns: Iterable[PartColumn]
 ) -> bytes:
+    """Render serialization metadata containing only recovered columns."""
     names = {column.name for column in columns}
     result = dict(serialization)
     if "columns" in result:
