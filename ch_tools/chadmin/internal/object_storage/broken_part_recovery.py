@@ -93,6 +93,7 @@ def recover_part(
     part_name: Optional[str],
     part_path: Optional[str],
     target_table: Optional[str],
+    dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
     """Recover intact source columns into a new persistent MergeTree table."""
     plan = _prepare_recovery(
@@ -102,7 +103,11 @@ def recover_part(
         part_name,
         part_path,
         target_table,
+        dry_run=dry_run,
     )
+    if dry_run:
+        return _make_report(plan.source, plan.target, plan.analysis, dry_run=True)
+
     with _staged_recovery_part(ctx, plan) as stage:
         _materialize_recovery_target(ctx, stage, plan)
     return _make_report(plan.source, plan.target, plan.analysis)
@@ -115,6 +120,7 @@ def _prepare_recovery(
     part_name: Optional[str],
     part_path: Optional[str],
     target_table: Optional[str],
+    dry_run: bool = False,
 ) -> _RecoveryPlan:
     """Resolve inputs, inspect S3 files, and analyze recoverable columns."""
     ch_version = get_version(ctx)
@@ -127,9 +133,7 @@ def _prepare_recovery(
         parse_qualified_table(target_table) if target_table is not None else None
     )
     source = resolve_recovery_source(ctx, database, table, part_name, part_path)
-    target = explicit_target or _generated_table(
-        source.table.ref.database, "_chadmin_recovered_"
-    )
+    target = explicit_target or _generated_target_table(source)
     _assert_target_absent(ctx, target)
 
     disk_conf = _get_s3_disk_configuration(ctx, source.disk.name)
@@ -144,8 +148,16 @@ def _prepare_recovery(
         ),
     )
     disk_client = ClickHouseDiskClient(source.disk.name)
-    restore_missing_empty_objects(source, s3_client, disk_conf)
+    restored_files = restore_missing_empty_objects(
+        source,
+        s3_client,
+        disk_conf,
+        dry_run=dry_run,
+    )
     file_recoverability = inspect_file_recoverability(source, s3_client, disk_conf)
+    if dry_run:
+        for filename in restored_files:
+            file_recoverability[filename] = True
     analysis = _analyze_part(ctx, disk_client, source, file_recoverability)
     return _RecoveryPlan(
         target,
@@ -153,6 +165,14 @@ def _prepare_recovery(
         disk_client,
         file_recoverability,
         analysis,
+    )
+
+
+def _generated_target_table(source: RecoverySource) -> TableRef:
+    """Build the deterministic default target table reference."""
+    return TableRef(
+        source.table.ref.database,
+        f"{source.table.ref.table}_recovered_{source.part_name}",
     )
 
 
@@ -795,6 +815,7 @@ def _make_report(
     source: RecoverySource,
     target: TableRef,
     analysis: RecoveryAnalysis,
+    dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
     recovered_names = {column.name for column in analysis.recovered_columns}
     result: List[Dict[str, Any]] = []
@@ -813,7 +834,9 @@ def _make_report(
                 "source_column": column.name,
                 "target_column": target_column,
                 "type": column.type,
-                "status": "recovered" if recovered else "lost",
+                "status": (
+                    ("recoverable" if dry_run else "recovered") if recovered else "lost"
+                ),
                 "missing_files": analysis.lost_files_by_column.get(column.name, []),
                 "physical_rows": analysis.rows,
             }

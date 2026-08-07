@@ -257,7 +257,7 @@ def missing_object_error(code: str = "404") -> ClientError:
 
 @patch("ch_tools.chadmin.internal.object_storage.part_recovery_source.logging")
 def test_restore_missing_empty_objects_repairs_only_empty_missing_objects(
-    logging: MagicMock,
+    _logging: MagicMock,
     tmp_path: Path,
 ) -> None:
     source = make_recovery_source(
@@ -282,6 +282,32 @@ def test_restore_missing_empty_objects_repairs_only_empty_missing_objects(
     ]
 
 
+@patch("ch_tools.chadmin.internal.object_storage.part_recovery_source.logging")
+def test_restore_missing_empty_objects_dry_run_only_simulates_repairs(
+    _logging: MagicMock,
+    tmp_path: Path,
+) -> None:
+    source = make_recovery_source(
+        tmp_path,
+        "4\n2 0\n0 object-a\n0 object-b\n0\n0\n",
+    )
+    client = MagicMock()
+    client.head_object.side_effect = [
+        missing_object_error(),
+        missing_object_error(),
+    ]
+
+    restored = recovery_source.restore_missing_empty_objects(
+        source,
+        client,
+        MagicMock(prefix="", bucket_name="bucket"),
+        dry_run=True,
+    )
+
+    assert restored == ["data.bin"]
+    client.put_object.assert_not_called()
+
+
 def test_restore_missing_empty_objects_leaves_mixed_file_untouched(
     tmp_path: Path,
 ) -> None:
@@ -301,7 +327,7 @@ def test_restore_missing_empty_objects_leaves_mixed_file_untouched(
         MagicMock(prefix="", bucket_name="bucket"),
     )
 
-    assert restored == []
+    assert not restored
     client.put_object.assert_not_called()
 
 
@@ -505,7 +531,72 @@ def test_missing_target_uses_generated_table_in_source_database(
 
     plan = recovery._prepare_recovery(ctx, None, None, None, "/part", None)
 
-    assert plan.target == TableRef("source_db", "_chadmin_recovered_stage")
+    assert plan.target == TableRef("source_db", "source_recovered_part")
+
+
+def test_dry_run_promotes_simulated_empty_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_recover_part_dependencies(monkeypatch)
+    restore_empty = MagicMock(return_value=["value.bin"])
+    inspect_files = MagicMock(return_value={"value.bin": False})
+    monkeypatch.setattr(recovery, "restore_missing_empty_objects", restore_empty)
+    monkeypatch.setattr(recovery, "inspect_file_recoverability", inspect_files)
+    ctx = MagicMock()
+    ctx.obj = {"config": {"object_storage": {"bucket_name_prefix": "", "retries": {}}}}
+
+    plan = recovery._prepare_recovery(
+        ctx, None, None, None, "/part", None, dry_run=True
+    )
+
+    assert plan.file_recoverability == {"value.bin": True}
+    assert restore_empty.call_args.kwargs == {"dry_run": True}
+
+
+def test_dry_run_reports_recoverable_columns_without_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = RecoverySource(
+        SourceTable(TableRef("source_db", "source"), "s3", ["/disk/source"]),
+        DiskInfo("s3", Path("/disk")),
+        Path("/disk/source/detached/part"),
+        "source/detached/part",
+        "part",
+    )
+    recovered = PartColumn("value", "UInt64", "value UInt64")
+    lost = PartColumn("lost", "String", "lost String")
+    analysis = RecoveryAnalysis(
+        "Wide",
+        [recovered, lost],
+        [recovered],
+        {"lost": ["lost.bin"]},
+        set(),
+        1,
+        None,
+        None,
+    )
+    plan = recovery._RecoveryPlan(
+        TableRef("source_db", "source_recovered_part"),
+        source,
+        MagicMock(),
+        {},
+        analysis,
+    )
+    prepare = MagicMock(return_value=plan)
+    staged = MagicMock()
+    monkeypatch.setattr(recovery, "_prepare_recovery", prepare)
+    monkeypatch.setattr(recovery, "_staged_recovery_part", staged)
+    ctx = MagicMock()
+
+    result = recovery.recover_part(ctx, None, None, None, "/part", None, dry_run=True)
+
+    assert [row["status"] for row in result] == ["recoverable", "lost"]
+    assert result[0]["target_table"] == "source_db.source_recovered_part"
+    assert [
+        row["status"] for row in recovery._make_report(source, plan.target, analysis)
+    ] == ["recovered", "lost"]
+    prepare.assert_called_once_with(ctx, None, None, None, "/part", None, dry_run=True)
+    staged.assert_not_called()
 
 
 @pytest.mark.parametrize(

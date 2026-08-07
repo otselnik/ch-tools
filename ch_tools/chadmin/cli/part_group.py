@@ -696,7 +696,17 @@ def remove_detached_part_prefix_command(
     "--target-table",
     help=(
         "New recovery table in DATABASE.TABLE form. By default, creates "
-        "SOURCE_DATABASE._chadmin_recovered_UUID."
+        "SOURCE_DATABASE.SOURCE_TABLE_recovered_PART_NAME."
+    ),
+)
+@option(
+    "-n",
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help=(
+        "Analyze recoverability without restoring S3 objects, staging the part, "
+        "or creating the target table."
     ),
 )
 @pass_context
@@ -707,6 +717,7 @@ def recover_part_command(
     part_name: Optional[str],
     part_path: Optional[str],
     target_table: Optional[str],
+    dry_run: bool,
 ) -> None:
     """Recover intact data from a broken detached S3 part.
 
@@ -719,6 +730,7 @@ def recover_part_command(
         part_name,
         part_path,
         target_table,
+        dry_run=dry_run,
     )
     print_response(ctx, result, default_format="table")
 

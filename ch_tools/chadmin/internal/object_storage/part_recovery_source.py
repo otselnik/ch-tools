@@ -280,8 +280,9 @@ def restore_missing_empty_objects(
     source: RecoverySource,
     s3_client: Boto3Client,
     disk_conf: S3DiskConfiguration,
+    dry_run: bool = False,
 ) -> List[str]:
-    """Restore logical files whose missing S3 objects are all known to be empty."""
+    """Restore or simulate logical files with known-empty missing S3 objects."""
     restored_files: List[str] = []
     for path in sorted(source.path.iterdir()):
         if not path.is_file():
@@ -309,14 +310,18 @@ def restore_missing_empty_objects(
         ):
             continue
 
-        for _, object_key in missing_objects:
-            if not restore_empty_object(s3_client, disk_conf.bucket_name, object_key):
-                raise RuntimeError(
-                    f"Empty object restoration verification failed for {path.name}"
-                )
+        if not dry_run:
+            for _, object_key in missing_objects:
+                if not restore_empty_object(
+                    s3_client, disk_conf.bucket_name, object_key
+                ):
+                    raise RuntimeError(
+                        f"Empty object restoration verification failed for {path.name}"
+                    )
         restored_files.append(path.name)
         logging.info(
-            "Restored {} missing empty S3 object(s) for {}",
+            "{} {} missing empty S3 object(s) for {}",
+            "Would restore" if dry_run else "Restored",
             len(missing_objects),
             path,
         )

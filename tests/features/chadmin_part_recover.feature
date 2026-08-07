@@ -140,17 +140,46 @@ Feature: Recover data from broken detached object-storage parts
         SELECT path FROM system.disks WHERE name = 'object_storage'
     ")
     RECOVERY_PATH="${DISK_PATH%/}/recovery-input/broken_part"
+    chadmin --format yaml part recover --dry-run --path "$RECOVERY_PATH" --database recovery_source --table source
+    """
+    Then we get response contains
+    """
+    target_table: recovery_source.source_recovered_broken_part
+    """
+    And we get response contains
+    """
+    status: recoverable
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT count()
+    FROM system.tables
+    WHERE database = 'recovery_source'
+      AND name = 'source_recovered_broken_part'
+    """
+    Then we get query response
+    """
+    0
+    """
+
+    When we execute command on clickhouse01
+    """
+    DISK_PATH=$(clickhouse client --query "
+        SELECT path FROM system.disks WHERE name = 'object_storage'
+    ")
+    RECOVERY_PATH="${DISK_PATH%/}/recovery-input/broken_part"
     chadmin --format yaml part recover --path "$RECOVERY_PATH" --database recovery_source --table source
     """
     Then we get response contains
     """
-    target_table: recovery_source._chadmin_recovered_
+    target_table: recovery_source.source_recovered_broken_part
     """
 
     When we execute query on clickhouse01
     """
     SELECT id, keep
-    FROM merge('recovery_source', '^_chadmin_recovered_')
+    FROM recovery_source.source_recovered_broken_part
     ORDER BY id
     """
     Then we get query response
