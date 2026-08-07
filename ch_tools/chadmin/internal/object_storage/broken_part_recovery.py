@@ -41,6 +41,7 @@ from ch_tools.chadmin.internal.object_storage.part_recovery_source import (
     quote_identifier,
     quote_string,
     resolve_recovery_source,
+    restore_missing_empty_objects,
 )
 from ch_tools.chadmin.internal.part import attach_part, list_parts
 from ch_tools.chadmin.internal.system import get_version
@@ -379,8 +380,19 @@ def _require_recoverable_file(
     file_recoverability: Dict[str, bool], filename: str
 ) -> None:
     """Require a logical part file and all its S3 blobs to be readable."""
-    if filename not in file_recoverability or not file_recoverability[filename]:
-        raise ValueError(f"Required structural file is not recoverable: {filename}")
+    if filename in file_recoverability and file_recoverability[filename]:
+        return
+    if filename == COLUMNS_FILE:
+        raise ValueError(
+            "Required structural file is not recoverable: columns.txt; "
+            "the original part schema cannot be inferred safely after detach"
+        )
+    if filename == COUNT_FILE:
+        raise ValueError(
+            "Required structural file is not recoverable: count.txt; "
+            "the physical row count is unavailable after detach"
+        )
+    raise ValueError(f"Required structural file is not recoverable: {filename}")
 
 
 def _read_source_file(
@@ -471,6 +483,7 @@ def _prepare_recovery(
         ),
     )
     disk_client = ClickHouseDiskClient(source.disk.name)
+    restore_missing_empty_objects(source, s3_client, disk_conf)
     file_recoverability = inspect_file_recoverability(source, s3_client, disk_conf)
     analysis = _analyze_part(ctx, disk_client, source, file_recoverability)
     return _RecoveryPlan(

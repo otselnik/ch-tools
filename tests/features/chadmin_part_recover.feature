@@ -187,6 +187,7 @@ Feature: Recover data from broken detached object-storage parts
     ALTER TABLE compact_recovery_source.source DETACH PARTITION tuple();
     """
     And we remove S3 blobs for file checksums.txt from detached part compact_recovery_source.source on clickhouse01
+    And we remove S3 blobs for file default_compression_codec.txt from detached part compact_recovery_source.source on clickhouse01
 
     When we execute command on clickhouse01
     """
@@ -200,6 +201,158 @@ Feature: Recover data from broken detached object-storage parts
     When we execute query on clickhouse01
     """
     SELECT id, value FROM recovered_compact.data ORDER BY id
+    """
+    Then we get query response
+    """
+    1\tone
+    2\ttwo
+    """
+
+  @require_version_25.8
+  Scenario: Restore a known-empty S3 object before recovering a Wide part
+    When we execute queries on clickhouse01
+    """
+    DROP DATABASE IF EXISTS empty_object_source;
+    DROP DATABASE IF EXISTS recovered_empty_object;
+
+    CREATE DATABASE empty_object_source;
+    CREATE TABLE empty_object_source.source
+    (
+        id UInt64,
+        empty_values Array(UInt64)
+    )
+    ENGINE = MergeTree
+    ORDER BY tuple()
+    SETTINGS
+        storage_policy = 'object_storage',
+        min_bytes_for_wide_part = 0,
+        min_rows_for_wide_part = 0;
+
+    INSERT INTO empty_object_source.source VALUES
+        (1, []),
+        (2, []);
+
+    ALTER TABLE empty_object_source.source DETACH PARTITION tuple();
+    """
+    And we remove S3 blobs for file empty_values.bin from detached part empty_object_source.source on clickhouse01
+
+    When we execute command on clickhouse01
+    """
+    PART_NAME=$(clickhouse client --query "
+        SELECT name FROM system.detached_parts
+        WHERE database = 'empty_object_source' AND table = 'source'
+    ")
+    chadmin part recover --database empty_object_source --table source --name "$PART_NAME" --target-table recovered_empty_object.data
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT id, empty_values
+    FROM recovered_empty_object.data
+    ORDER BY id
+    """
+    Then we get query response
+    """
+    1\t[]
+    2\t[]
+    """
+
+  @require_version_25.8
+  Scenario Outline: Reject a detached part without required <filename>
+    When we execute queries on clickhouse01
+    """
+    DROP DATABASE IF EXISTS missing_metadata_source;
+    DROP DATABASE IF EXISTS recovered_missing_metadata;
+
+    CREATE DATABASE missing_metadata_source;
+    CREATE TABLE missing_metadata_source.source
+    (
+        id UInt64,
+        lost String
+    )
+    ENGINE = MergeTree
+    ORDER BY tuple()
+    SETTINGS
+        storage_policy = 'object_storage',
+        min_bytes_for_wide_part = 0,
+        min_rows_for_wide_part = 0;
+
+    INSERT INTO missing_metadata_source.source VALUES (1, 'lost');
+    ALTER TABLE missing_metadata_source.source DETACH PARTITION tuple();
+    """
+    And we remove S3 blobs for file lost.bin from detached part missing_metadata_source.source on clickhouse01
+    And we remove S3 blobs for file <filename> from detached part missing_metadata_source.source on clickhouse01
+
+    When we try to execute command on clickhouse01
+    """
+    PART_NAME=$(clickhouse client --query "
+        SELECT name FROM system.detached_parts
+        WHERE database = 'missing_metadata_source' AND table = 'source'
+    ")
+    chadmin part recover --database missing_metadata_source --table source --name "$PART_NAME" --target-table recovered_missing_metadata.data
+    """
+    Then it fails with response contains
+    """
+    <error>
+    """
+
+    Examples:
+    | filename    | error                                             |
+    | columns.txt | the original part schema cannot be inferred safely |
+    | count.txt   | the physical row count is unavailable after detach  |
+
+  @require_version_25.8
+  Scenario: Recover a part after count.txt was restored before detach
+    When we execute queries on clickhouse01
+    """
+    DROP DATABASE IF EXISTS pre_repaired_source;
+    DROP DATABASE IF EXISTS recovered_pre_repaired;
+
+    CREATE DATABASE pre_repaired_source;
+    CREATE TABLE pre_repaired_source.source
+    (
+        id UInt64,
+        keep String,
+        lost String
+    )
+    ENGINE = MergeTree
+    ORDER BY tuple()
+    SETTINGS
+        storage_policy = 'object_storage',
+        min_bytes_for_wide_part = 0,
+        min_rows_for_wide_part = 0;
+
+    INSERT INTO pre_repaired_source.source VALUES
+        (1, 'one', 'lost-one'),
+        (2, 'two', 'lost-two');
+    """
+    And we remove s3 object for active part file count.txt from table pre_repaired_source.source on clickhouse01
+    And we remove s3 object for active part file lost.bin from table pre_repaired_source.source on clickhouse01
+
+    When we execute command on clickhouse01
+    """
+    chadmin --format yaml data-store detect-broken-partitions --restore-recoverable --detach
+    """
+    Then we get response contains
+    """
+      file: count.txt
+      status: restored
+    """
+
+    When we execute command on clickhouse01
+    """
+    PART_NAME=$(clickhouse client --query "
+        SELECT name FROM system.detached_parts
+        WHERE database = 'pre_repaired_source' AND table = 'source'
+    ")
+    chadmin part recover --database pre_repaired_source --table source --name "$PART_NAME" --target-table recovered_pre_repaired.data
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT id, keep
+    FROM recovered_pre_repaired.data
+    ORDER BY id
     """
     Then we get query response
     """

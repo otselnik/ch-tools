@@ -8,6 +8,9 @@ import pytest
 from botocore.exceptions import ClientError
 
 from ch_tools.chadmin.internal.object_storage import broken_part_recovery as recovery
+from ch_tools.chadmin.internal.object_storage import (
+    broken_partitions_recovery as partition_recovery,
+)
 from ch_tools.chadmin.internal.object_storage import part_recovery_metadata as metadata
 from ch_tools.chadmin.internal.object_storage import (
     part_recovery_source as recovery_source,
@@ -19,6 +22,7 @@ from ch_tools.chadmin.internal.object_storage.part_recovery_metadata import (
 )
 from ch_tools.chadmin.internal.object_storage.part_recovery_source import (
     DiskInfo,
+    RecoverySource,
     SourceTable,
     TableRef,
 )
@@ -26,6 +30,7 @@ from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     S3ObjectLocalInfo,
     get_object_storage_key,
     object_exists,
+    restore_empty_object,
 )
 
 
@@ -205,6 +210,144 @@ def test_wide_part_recovers_only_columns_with_all_streams(
     assert analysis.lost_files_by_column == {"b": ["b.bin"]}
 
 
+def test_restore_empty_object_uploads_and_verifies_content() -> None:
+    client = MagicMock()
+    client.head_object.return_value = {"ContentLength": 0}
+
+    assert restore_empty_object(client, "bucket", "empty")
+    client.put_object.assert_called_once_with(Bucket="bucket", Key="empty", Body=b"")
+
+    client.head_object.return_value = {"ContentLength": 1}
+    assert not restore_empty_object(client, "bucket", "not-empty")
+
+
+def test_partition_recovery_keeps_empty_object_report_semantics() -> None:
+    part_info = MagicMock()
+    missing_object = MagicMock(object_key="empty")
+    client = MagicMock()
+
+    with patch.object(partition_recovery, "restore_empty_object", return_value=False):
+        report = partition_recovery.restore_empty_objects(
+            part_info, [missing_object], client, "bucket"
+        )
+
+    assert report[0]["status"] == "unrecoverable"
+    assert report[0]["detail"] == "empty object upload verification failed"
+
+
+def make_recovery_source(tmp_path: Path, metadata_text: str) -> RecoverySource:
+    part_path = tmp_path / "source" / "detached" / "part"
+    part_path.mkdir(parents=True)
+    (part_path / "data.bin").write_text(metadata_text, encoding="latin-1")
+    return RecoverySource(
+        SourceTable(TableRef("db", "source"), "s3", [str(tmp_path / "source")]),
+        DiskInfo("s3", tmp_path),
+        part_path,
+        "source/detached/part",
+        "part",
+    )
+
+
+def missing_object_error(code: str = "404") -> ClientError:
+    return ClientError(
+        {"Error": {"Code": code, "Message": "missing"}},
+        "HeadObject",
+    )
+
+
+@patch("ch_tools.chadmin.internal.object_storage.part_recovery_source.logging")
+def test_restore_missing_empty_objects_repairs_only_empty_missing_objects(
+    logging: MagicMock,
+    tmp_path: Path,
+) -> None:
+    source = make_recovery_source(
+        tmp_path,
+        "4\n2 0\n0 object-a\n0 /object-b\n0\n0\n",
+    )
+    client = MagicMock()
+    client.head_object.side_effect = [
+        missing_object_error(),
+        missing_object_error(),
+        {"ContentLength": 0},
+        {"ContentLength": 0},
+    ]
+    disk_conf = MagicMock(prefix="prefix/", bucket_name="bucket")
+
+    restored = recovery_source.restore_missing_empty_objects(source, client, disk_conf)
+
+    assert restored == ["data.bin"]
+    assert client.put_object.call_args_list == [
+        call(Bucket="bucket", Key="prefix/object-a", Body=b""),
+        call(Bucket="bucket", Key="prefix/object-b", Body=b""),
+    ]
+
+
+def test_restore_missing_empty_objects_leaves_mixed_file_untouched(
+    tmp_path: Path,
+) -> None:
+    source = make_recovery_source(
+        tmp_path,
+        "4\n2 1\n0 empty\n1 non-empty\n0\n0\n",
+    )
+    client = MagicMock()
+    client.head_object.side_effect = [
+        missing_object_error(),
+        missing_object_error(),
+    ]
+
+    restored = recovery_source.restore_missing_empty_objects(
+        source,
+        client,
+        MagicMock(prefix="", bucket_name="bucket"),
+    )
+
+    assert restored == []
+    client.put_object.assert_not_called()
+
+
+def test_restore_missing_empty_objects_propagates_access_denied(
+    tmp_path: Path,
+) -> None:
+    source = make_recovery_source(
+        tmp_path,
+        "4\n1 0\n0 empty\n0\n0\n",
+    )
+    client = MagicMock()
+    client.head_object.side_effect = missing_object_error("AccessDenied")
+
+    with pytest.raises(ClientError):
+        recovery_source.restore_missing_empty_objects(
+            source,
+            client,
+            MagicMock(prefix="", bucket_name="bucket"),
+        )
+    client.put_object.assert_not_called()
+
+
+def test_restore_missing_empty_objects_rejects_failed_verification(
+    tmp_path: Path,
+) -> None:
+    source = make_recovery_source(
+        tmp_path,
+        "5\n1 0\n0 full/path\n0\n0\n",
+    )
+    client = MagicMock()
+    client.head_object.side_effect = [
+        missing_object_error(),
+        {"ContentLength": 1},
+    ]
+
+    with pytest.raises(RuntimeError, match="verification failed for data.bin"):
+        recovery_source.restore_missing_empty_objects(
+            source,
+            client,
+            MagicMock(prefix="ignored", bucket_name="bucket"),
+        )
+    client.put_object.assert_called_once_with(
+        Bucket="bucket", Key="full/path", Body=b""
+    )
+
+
 @patch("ch_tools.chadmin.internal.object_storage.part_recovery_source.execute_query")
 def test_path_infers_table_from_detached_data_path(
     execute_query: MagicMock, tmp_path: Path
@@ -341,6 +484,7 @@ def patch_recover_part_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(recovery.boto3, "client", MagicMock())
     monkeypatch.setattr(recovery, "ClickHouseDiskClient", MagicMock())
     monkeypatch.setattr(recovery, "get_version", MagicMock(return_value="25.8"))
+    monkeypatch.setattr(recovery, "restore_missing_empty_objects", MagicMock())
     monkeypatch.setattr(
         recovery, "inspect_file_recoverability", MagicMock(return_value={})
     )
@@ -362,6 +506,20 @@ def test_missing_target_uses_generated_table_in_source_database(
     plan = recovery._prepare_recovery(ctx, None, None, None, "/part", None)
 
     assert plan.target == TableRef("source_db", "_chadmin_recovered_stage")
+
+
+@pytest.mark.parametrize(
+    "filename,error",
+    [
+        ("columns.txt", "original part schema cannot be inferred safely"),
+        ("count.txt", "physical row count is unavailable after detach"),
+    ],
+)
+def test_required_detached_metadata_has_specific_error(
+    filename: str, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        recovery._require_recoverable_file({filename: False}, filename)
 
 
 def test_non_s3_disk_is_rejected_before_recovery(

@@ -14,6 +14,7 @@ from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     S3ObjectLocalMetaData,
     get_object_storage_key,
     object_exists,
+    restore_empty_object,
 )
 from ch_tools.chadmin.internal.part import (
     list_detached_parts,
@@ -311,9 +312,7 @@ def restore_empty_objects(
 ) -> List[Dict[str, Any]]:
     report: List[Dict[str, Any]] = []
     for missing_object in missing_objects:
-        s3_client.put_object(Bucket=bucket, Key=missing_object.object_key, Body=b"")
-        head = s3_client.head_object(Bucket=bucket, Key=missing_object.object_key)
-        if head.get("ContentLength") == 0:
+        if restore_empty_object(s3_client, bucket, missing_object.object_key):
             report.append(
                 make_restore_report(
                     part_info,

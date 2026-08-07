@@ -136,3 +136,10 @@ def object_exists(s3_client: Boto3Client, bucket: str, key: str) -> bool:
             return False
         raise
     return True
+
+
+def restore_empty_object(s3_client: Boto3Client, bucket: str, key: str) -> bool:
+    """Upload a known-empty object and verify that it remained empty."""
+    s3_client.put_object(Bucket=bucket, Key=key, Body=b"")
+    head = s3_client.head_object(Bucket=bucket, Key=key)
+    return head.get("ContentLength") == 0

@@ -11,6 +11,7 @@ from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     S3ObjectLocalMetaData,
     get_object_storage_key,
     object_exists,
+    restore_empty_object,
 )
 from ch_tools.chadmin.internal.part import get_disks, list_detached_parts
 from ch_tools.chadmin.internal.table import list_tables
@@ -273,3 +274,50 @@ def inspect_file_recoverability(
             logging.warning("Cannot parse metadata file {}: {!r}", path, e)
             result[path.name] = False
     return result
+
+
+def restore_missing_empty_objects(
+    source: RecoverySource,
+    s3_client: Boto3Client,
+    disk_conf: S3DiskConfiguration,
+) -> List[str]:
+    """Restore logical files whose missing S3 objects are all known to be empty."""
+    restored_files: List[str] = []
+    for path in sorted(source.path.iterdir()):
+        if not path.is_file():
+            continue
+        try:
+            metadata = S3ObjectLocalMetaData.from_file(path)
+            missing_objects = [
+                (
+                    object_info,
+                    get_object_storage_key(disk_conf.prefix, object_info),
+                )
+                for object_info in metadata.objects
+                if not object_exists(
+                    s3_client,
+                    disk_conf.bucket_name,
+                    get_object_storage_key(disk_conf.prefix, object_info),
+                )
+            ]
+        except (OSError, ValueError) as e:
+            logging.warning("Cannot parse metadata file {}: {!r}", path, e)
+            continue
+
+        if not missing_objects or any(
+            object_info.size != 0 for object_info, _ in missing_objects
+        ):
+            continue
+
+        for _, object_key in missing_objects:
+            if not restore_empty_object(s3_client, disk_conf.bucket_name, object_key):
+                raise RuntimeError(
+                    f"Empty object restoration verification failed for {path.name}"
+                )
+        restored_files.append(path.name)
+        logging.info(
+            "Restored {} missing empty S3 object(s) for {}",
+            len(missing_objects),
+            path,
+        )
+    return restored_files
