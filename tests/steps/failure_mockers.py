@@ -3,6 +3,7 @@ Steps for interacting with ClickHouse DBMS.
 """
 
 import os
+import shlex
 
 from behave import when
 from hamcrest import assert_that, equal_to
@@ -11,6 +12,10 @@ from modules.clickhouse import execute_query
 from modules.docker import get_container
 from modules.steps import get_step_data
 from modules.typing import ContextT
+
+from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
+    S3ObjectLocalMetaData,
+)
 
 
 @when("we remove key from s3 for partitions database {database} on {node:w}")
@@ -75,6 +80,65 @@ def step_remove_file_blobs_from_detached_part(
     for remote_path in remote_paths:
         s3_client.delete_data(remote_path)
         assert not s3_client.path_exists(remote_path)
+
+
+@when(
+    "we make file {filename} reference a missing empty S3 object in detached part "
+    "{database}.{table} on {node:w}"
+)
+def step_make_file_reference_missing_empty_s3_object(
+    context: ContextT,
+    filename: str,
+    database: str,
+    table: str,
+    node: str,
+) -> None:
+    detached_parts = execute_query(
+        context,
+        node,
+        (
+            "SELECT path FROM system.detached_parts "
+            f"WHERE database='{database}' AND table='{table}'"
+        ),
+        format_="JSONCompact",
+    )["data"]
+    assert len(detached_parts) == 1, (
+        f"Expected one detached part for {database}.{table}, "
+        f"found {len(detached_parts)}"
+    )
+
+    part_path = detached_parts[0][0]
+    logical_path = os.path.join(part_path, filename)
+    container = get_container(context, node)
+    read_result = container.exec_run(["cat", logical_path])
+    assert read_result.exit_code == 0, read_result.output.decode(errors="replace")
+
+    metadata = S3ObjectLocalMetaData.from_string(
+        read_result.output.decode(encoding="latin-1")
+    )
+    assert metadata.total_size == 0, f"Expected {logical_path} to be empty"
+    assert not metadata.objects, f"Expected {logical_path} to have no S3 objects"
+    assert (
+        metadata.has_full_object_key()
+    ), f"Expected full S3 object keys in metadata version {metadata.version}"
+
+    reference_key = get_s3_object_keys_for_part_file(
+        context, node, part_path, "id.bin"
+    )[0]
+    missing_key = f"{reference_key}.missing-empty"
+    s3_client = s3.S3Client(context)
+    assert not s3_client.path_exists(missing_key)
+
+    replacement = (
+        f"{metadata.version}\n"
+        f"1\t0\n"
+        f"0\t{missing_key}\n"
+        f"{metadata.ref_counter}\n"
+        f"{int(metadata.read_only)}\n\n"
+    )
+    command = f"printf %s {shlex.quote(replacement)} > {shlex.quote(logical_path)}"
+    write_result = container.exec_run(["bash", "-c", command], user="root")
+    assert write_result.exit_code == 0, write_result.output.decode(errors="replace")
 
 
 @when(

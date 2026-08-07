@@ -263,7 +263,7 @@ Feature: Recover data from broken detached object-storage parts
 
     ALTER TABLE empty_object_source.source DETACH PARTITION tuple();
     """
-    And we remove S3 blobs for file empty_values.bin from detached part empty_object_source.source on clickhouse01
+    And we make file empty_values.bin reference a missing empty S3 object in detached part empty_object_source.source on clickhouse01
 
     When we execute command on clickhouse01
     """
@@ -272,6 +272,10 @@ Feature: Recover data from broken detached object-storage parts
         WHERE database = 'empty_object_source' AND table = 'source'
     ")
     chadmin part recover --database empty_object_source --table source --name "$PART_NAME" --target-table recovered_empty_object.data
+    """
+    Then we get response contains
+    """
+    Restored 1 missing empty S3 object(s)
     """
 
     When we execute query on clickhouse01
