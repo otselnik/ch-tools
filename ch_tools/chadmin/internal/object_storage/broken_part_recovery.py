@@ -86,6 +86,101 @@ class _RecoveryPlan:
     analysis: RecoveryAnalysis
 
 
+def recover_part(
+    ctx: Context,
+    database: Optional[str],
+    table: Optional[str],
+    part_name: Optional[str],
+    part_path: Optional[str],
+    target_table: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Recover intact source columns into a new persistent MergeTree table."""
+    plan = _prepare_recovery(
+        ctx,
+        database,
+        table,
+        part_name,
+        part_path,
+        target_table,
+    )
+    with _staged_recovery_part(ctx, plan) as stage:
+        _materialize_recovery_target(ctx, stage, plan)
+    return _make_report(plan.source, plan.target, plan.analysis)
+
+
+def _prepare_recovery(
+    ctx: Context,
+    database: Optional[str],
+    table: Optional[str],
+    part_name: Optional[str],
+    part_path: Optional[str],
+    target_table: Optional[str],
+) -> _RecoveryPlan:
+    """Resolve inputs, inspect S3 files, and analyze recoverable columns."""
+    ch_version = get_version(ctx)
+    if not version_ge(ch_version, MIN_CLICKHOUSE_VERSION):
+        raise RuntimeError(
+            f"Part recovery requires ClickHouse version {MIN_CLICKHOUSE_VERSION} or above"
+        )
+
+    explicit_target = (
+        parse_qualified_table(target_table) if target_table is not None else None
+    )
+    source = resolve_recovery_source(ctx, database, table, part_name, part_path)
+    target = explicit_target or _generated_table(
+        source.table.ref.database, "_chadmin_recovered_"
+    )
+    _assert_target_absent(ctx, target)
+
+    disk_conf = _get_s3_disk_configuration(ctx, source.disk.name)
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=disk_conf.endpoint_url,
+        aws_access_key_id=disk_conf.access_key_id,
+        aws_secret_access_key=disk_conf.secret_access_key,
+        config=Config(
+            s3={"addressing_style": "auto"},
+            retries=ctx.obj["config"]["object_storage"].get("retries"),
+        ),
+    )
+    disk_client = ClickHouseDiskClient(source.disk.name)
+    restore_missing_empty_objects(source, s3_client, disk_conf)
+    file_recoverability = inspect_file_recoverability(source, s3_client, disk_conf)
+    analysis = _analyze_part(ctx, disk_client, source, file_recoverability)
+    return _RecoveryPlan(
+        target,
+        source,
+        disk_client,
+        file_recoverability,
+        analysis,
+    )
+
+
+def _generated_table(database: str, prefix: str) -> TableRef:
+    """Build a collision-resistant internal table reference."""
+    return TableRef(database, f"{prefix}{uuid.uuid4().hex}")
+
+
+def _assert_target_absent(ctx: Context, target: TableRef) -> None:
+    if table_exists(ctx, target.database, target.table):
+        raise ValueError(f"Target table already exists: {target.display}")
+
+
+def _get_s3_disk_configuration(ctx: Context, disk_name: str) -> S3DiskConfiguration:
+    ch_config = get_clickhouse_config(ctx)
+    disk_config = ch_config.storage_configuration.get_disk_config(disk_name)
+    disk_type = disk_config.get("object_storage_type", disk_config.get("type"))
+    if disk_type != S3DiskConfiguration.OBJECT_STORAGE_TYPE:
+        raise ValueError(
+            f"Part recovery supports only S3 disks; disk {disk_name} has type {disk_type}"
+        )
+    return S3DiskConfiguration.from_config(
+        ch_config.storage_configuration,
+        disk_name,
+        ctx.obj["config"]["object_storage"]["bucket_name_prefix"],
+    )
+
+
 def _analyze_part(
     ctx: Context,
     disk_client: ClickHouseDiskClient,
@@ -136,6 +231,31 @@ def _analyze_part(
         if not analysis.has_row_exists:
             raise ValueError("The lightweight-delete mask is not fully recoverable")
     return analysis
+
+
+def _require_recoverable_file(
+    file_recoverability: Dict[str, bool], filename: str
+) -> None:
+    """Require a logical part file and all its S3 blobs to be readable."""
+    if filename in file_recoverability and file_recoverability[filename]:
+        return
+    if filename == COLUMNS_FILE:
+        raise ValueError(
+            "Required structural file is not recoverable: columns.txt; "
+            "the original part schema cannot be inferred safely after detach"
+        )
+    if filename == COUNT_FILE:
+        raise ValueError(
+            "Required structural file is not recoverable: count.txt; "
+            "the physical row count is unavailable after detach"
+        )
+    raise ValueError(f"Required structural file is not recoverable: {filename}")
+
+
+def _read_source_file(
+    disk_client: ClickHouseDiskClient, source: RecoverySource, filename: str
+) -> bytes:
+    return disk_client.read(os.path.join(source.relative_path, filename))
 
 
 def _analyze_compact(
@@ -259,6 +379,45 @@ def _analyze_wide_with_substreams(
     )
 
 
+def _hash_stream_names(ctx: Context, streams: List[str]) -> List[str]:
+    if not streams:
+        return []
+    values = ", ".join(quote_string(stream) for stream in streams)
+    rows = execute_query(
+        ctx,
+        f"""
+        SELECT arrayMap(
+            x -> lower(hex(reverse(CAST(sipHash128(x), 'FixedString(16)')))),
+            [{values}]
+        )
+        """,
+        format_="JSONCompact",
+    )["data"]
+    return list(rows[0][0])
+
+
+def _resolve_stream_base(
+    stream: str, stream_hash: str, file_recoverability: Dict[str, bool]
+) -> Optional[str]:
+    if stream + ".bin" in file_recoverability or _marks_for_base(
+        stream, file_recoverability
+    ):
+        return stream
+    if stream_hash + ".bin" in file_recoverability or _marks_for_base(
+        stream_hash, file_recoverability
+    ):
+        return stream_hash
+    return None
+
+
+def _marks_for_base(base: str, file_recoverability: Dict[str, bool]) -> List[str]:
+    return sorted(
+        name
+        for name in file_recoverability
+        if name.startswith(base + ".") and MARK_SUFFIX_RE.search(name)
+    )
+
+
 def _analyze_legacy_wide(
     columns: List[PartColumn],
     file_recoverability: Dict[str, bool],
@@ -337,169 +496,16 @@ def _analyze_legacy_wide(
     )
 
 
-def _hash_stream_names(ctx: Context, streams: List[str]) -> List[str]:
-    if not streams:
-        return []
-    values = ", ".join(quote_string(stream) for stream in streams)
-    rows = execute_query(
-        ctx,
-        f"""
-        SELECT arrayMap(
-            x -> lower(hex(reverse(CAST(sipHash128(x), 'FixedString(16)')))),
-            [{values}]
-        )
-        """,
-        format_="JSONCompact",
-    )["data"]
-    return list(rows[0][0])
-
-
-def _resolve_stream_base(
-    stream: str, stream_hash: str, file_recoverability: Dict[str, bool]
-) -> Optional[str]:
-    if stream + ".bin" in file_recoverability or _marks_for_base(
-        stream, file_recoverability
-    ):
-        return stream
-    if stream_hash + ".bin" in file_recoverability or _marks_for_base(
-        stream_hash, file_recoverability
-    ):
-        return stream_hash
-    return None
-
-
-def _marks_for_base(base: str, file_recoverability: Dict[str, bool]) -> List[str]:
-    return sorted(
-        name
-        for name in file_recoverability
-        if name.startswith(base + ".") and MARK_SUFFIX_RE.search(name)
-    )
-
-
-def _require_recoverable_file(
-    file_recoverability: Dict[str, bool], filename: str
-) -> None:
-    """Require a logical part file and all its S3 blobs to be readable."""
-    if filename in file_recoverability and file_recoverability[filename]:
-        return
-    if filename == COLUMNS_FILE:
-        raise ValueError(
-            "Required structural file is not recoverable: columns.txt; "
-            "the original part schema cannot be inferred safely after detach"
-        )
-    if filename == COUNT_FILE:
-        raise ValueError(
-            "Required structural file is not recoverable: count.txt; "
-            "the physical row count is unavailable after detach"
-        )
-    raise ValueError(f"Required structural file is not recoverable: {filename}")
-
-
-def _read_source_file(
-    disk_client: ClickHouseDiskClient, source: RecoverySource, filename: str
-) -> bytes:
-    return disk_client.read(os.path.join(source.relative_path, filename))
-
-
-def _get_s3_disk_configuration(ctx: Context, disk_name: str) -> S3DiskConfiguration:
-    ch_config = get_clickhouse_config(ctx)
-    disk_config = ch_config.storage_configuration.get_disk_config(disk_name)
-    disk_type = disk_config.get("object_storage_type", disk_config.get("type"))
-    if disk_type != S3DiskConfiguration.OBJECT_STORAGE_TYPE:
-        raise ValueError(
-            f"Part recovery supports only S3 disks; disk {disk_name} has type {disk_type}"
-        )
-    return S3DiskConfiguration.from_config(
-        ch_config.storage_configuration,
-        disk_name,
-        ctx.obj["config"]["object_storage"]["bucket_name_prefix"],
-    )
-
-
-@contextmanager
-def _temporary_recovery_table(
-    ctx: Context,
-    table: TableRef,
-    columns: List[PartColumn],
-    storage_policy: str,
-) -> Generator[None, None, None]:
-    """Create a temporary table and always attempt to remove it."""
-    failure: Optional[BaseException] = None
-    try:
-        _create_recovery_table(ctx, table, columns, storage_policy)
-        yield
-    except BaseException as e:
-        failure = e
-        raise
-    finally:
-        try:
-            delete_table(ctx, table.database, table.table)
-        except Exception:
-            if failure is None:
-                raise
-            logging.exception(
-                "Failed to clean up temporary recovery table {}", table.display
-            )
-
-
-def _generated_table(database: str, prefix: str) -> TableRef:
-    """Build a collision-resistant internal table reference."""
-    return TableRef(database, f"{prefix}{uuid.uuid4().hex}")
-
-
-def _prepare_recovery(
-    ctx: Context,
-    database: Optional[str],
-    table: Optional[str],
-    part_name: Optional[str],
-    part_path: Optional[str],
-    target_table: Optional[str],
-) -> _RecoveryPlan:
-    """Resolve inputs, inspect S3 files, and analyze recoverable columns."""
-    ch_version = get_version(ctx)
-    if not version_ge(ch_version, MIN_CLICKHOUSE_VERSION):
-        raise RuntimeError(
-            f"Part recovery requires ClickHouse version {MIN_CLICKHOUSE_VERSION} or above"
-        )
-
-    explicit_target = (
-        parse_qualified_table(target_table) if target_table is not None else None
-    )
-    source = resolve_recovery_source(ctx, database, table, part_name, part_path)
-    target = explicit_target or _generated_table(
-        source.table.ref.database, "_chadmin_recovered_"
-    )
-    _assert_target_absent(ctx, target)
-
-    disk_conf = _get_s3_disk_configuration(ctx, source.disk.name)
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=disk_conf.endpoint_url,
-        aws_access_key_id=disk_conf.access_key_id,
-        aws_secret_access_key=disk_conf.secret_access_key,
-        config=Config(
-            s3={"addressing_style": "auto"},
-            retries=ctx.obj["config"]["object_storage"].get("retries"),
-        ),
-    )
-    disk_client = ClickHouseDiskClient(source.disk.name)
-    restore_missing_empty_objects(source, s3_client, disk_conf)
-    file_recoverability = inspect_file_recoverability(source, s3_client, disk_conf)
-    analysis = _analyze_part(ctx, disk_client, source, file_recoverability)
-    return _RecoveryPlan(
-        target,
-        source,
-        disk_client,
-        file_recoverability,
-        analysis,
-    )
-
-
 @contextmanager
 def _staged_recovery_part(
     ctx: Context, plan: _RecoveryPlan
 ) -> Generator[TableRef, None, None]:
-    """Build, attach, and validate the temporary part used for recovery."""
+    """Build and attach a readable part in a temporary staging table.
+
+    The staging table lets ClickHouse validate the rebuilt part and read its
+    intact columns. Recovered rows are copied from it into the separate,
+    persistent target table.
+    """
     stage = _generated_table(
         plan.source.table.ref.database,
         "_chadmin_recover_",
@@ -507,7 +513,7 @@ def _staged_recovery_part(
     stage_columns = [
         column for column in plan.analysis.columns if column.name != ROW_EXISTS_COLUMN
     ]
-    with _temporary_recovery_table(
+    with _temporary_staging_table(
         ctx,
         stage,
         stage_columns,
@@ -551,87 +557,38 @@ def _staged_recovery_part(
         yield stage
 
 
-def _materialize_recovery_target(
-    ctx: Context, stage: TableRef, plan: _RecoveryPlan
-) -> None:
-    """Create and validate the persistent target, removing it after failures."""
-    target_created = False
-    try:
-        execute_query(
-            ctx,
-            f"CREATE DATABASE IF NOT EXISTS "
-            f"{quote_identifier(plan.target.database)}",
-            format_=None,
-        )
-        target_columns = list(plan.analysis.recovered_user_columns)
-        if plan.analysis.has_row_exists:
-            target_columns.append(
-                PartColumn(
-                    RECOVERY_ROW_EXISTS_COLUMN,
-                    "UInt8",
-                    f"{quote_identifier(RECOVERY_ROW_EXISTS_COLUMN)} UInt8",
-                )
-            )
-        _create_recovery_table(
-            ctx,
-            plan.target,
-            target_columns,
-            plan.source.table.storage_policy,
-        )
-        target_created = True
-        _insert_recovered_data(ctx, stage, plan.target, plan.analysis)
-
-        target_rows = int(
-            execute_query(
-                ctx,
-                f"SELECT count() FROM {plan.target.sql}",
-                format_=None,
-            )
-        )
-        if target_rows != plan.analysis.rows:
-            raise RuntimeError(
-                "Target row count differs: "
-                f"expected {plan.analysis.rows}, got {target_rows}"
-            )
-        if not check_table(ctx, plan.target.database, plan.target.table):
-            raise RuntimeError("CHECK TABLE failed for the recovery target")
-    except BaseException:
-        if target_created:
-            try:
-                delete_table(ctx, plan.target.database, plan.target.table)
-            except Exception:
-                logging.exception(
-                    "Failed to clean up incomplete recovery target {}",
-                    plan.target.display,
-                )
-        raise
-
-
-def recover_part(
+@contextmanager
+def _temporary_staging_table(
     ctx: Context,
-    database: Optional[str],
-    table: Optional[str],
-    part_name: Optional[str],
-    part_path: Optional[str],
-    target_table: Optional[str],
-) -> List[Dict[str, Any]]:
-    """Recover intact source columns into a new persistent MergeTree table."""
-    plan = _prepare_recovery(
-        ctx,
-        database,
-        table,
-        part_name,
-        part_path,
-        target_table,
-    )
-    with _staged_recovery_part(ctx, plan) as stage:
-        _materialize_recovery_target(ctx, stage, plan)
-    return _make_report(plan.source, plan.target, plan.analysis)
+    table: TableRef,
+    columns: List[PartColumn],
+    storage_policy: str,
+) -> Generator[None, None, None]:
+    """Create an internal staging table and remove it on every exit.
 
-
-def _assert_target_absent(ctx: Context, target: TableRef) -> None:
-    if table_exists(ctx, target.database, target.table):
-        raise ValueError(f"Target table already exists: {target.display}")
+    This table is only scratch space for attaching and reading the rebuilt
+    part; it is never the recovery result. Its collision-resistant name is
+    generated by chadmin, so this context owns its complete lifecycle.
+    """
+    failure: Optional[BaseException] = None
+    try:
+        _create_recovery_table(ctx, table, columns, storage_policy)
+        yield
+    except BaseException as e:
+        failure = e
+        raise
+    finally:
+        # Cleanup is attempted even if CREATE TABLE or subsequent staging work
+        # failed, so neither ClickHouse metadata nor staging data is left behind.
+        try:
+            delete_table(ctx, table.database, table.table)
+        except Exception:
+            if failure is None:
+                raise
+            # Keep the original recovery error as the primary failure.
+            logging.exception(
+                "Failed to clean up temporary staging table {}", table.display
+            )
 
 
 def _create_recovery_table(
@@ -745,6 +702,62 @@ def _get_only_active_part(ctx: Context, table: TableRef) -> str:
             f"Expected one active staging part for {table.display}, found {len(rows)}"
         )
     return str(rows[0]["name"])
+
+
+def _materialize_recovery_target(
+    ctx: Context, stage: TableRef, plan: _RecoveryPlan
+) -> None:
+    """Create and validate the persistent target, removing it after failures."""
+    target_created = False
+    try:
+        execute_query(
+            ctx,
+            f"CREATE DATABASE IF NOT EXISTS "
+            f"{quote_identifier(plan.target.database)}",
+            format_=None,
+        )
+        target_columns = list(plan.analysis.recovered_user_columns)
+        if plan.analysis.has_row_exists:
+            target_columns.append(
+                PartColumn(
+                    RECOVERY_ROW_EXISTS_COLUMN,
+                    "UInt8",
+                    f"{quote_identifier(RECOVERY_ROW_EXISTS_COLUMN)} UInt8",
+                )
+            )
+        _create_recovery_table(
+            ctx,
+            plan.target,
+            target_columns,
+            plan.source.table.storage_policy,
+        )
+        target_created = True
+        _insert_recovered_data(ctx, stage, plan.target, plan.analysis)
+
+        target_rows = int(
+            execute_query(
+                ctx,
+                f"SELECT count() FROM {plan.target.sql}",
+                format_=None,
+            )
+        )
+        if target_rows != plan.analysis.rows:
+            raise RuntimeError(
+                "Target row count differs: "
+                f"expected {plan.analysis.rows}, got {target_rows}"
+            )
+        if not check_table(ctx, plan.target.database, plan.target.table):
+            raise RuntimeError("CHECK TABLE failed for the recovery target")
+    except BaseException:
+        if target_created:
+            try:
+                delete_table(ctx, plan.target.database, plan.target.table)
+            except Exception:
+                logging.exception(
+                    "Failed to clean up incomplete recovery target {}",
+                    plan.target.display,
+                )
+        raise
 
 
 def _insert_recovered_data(
