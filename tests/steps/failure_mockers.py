@@ -118,21 +118,46 @@ def step_make_file_reference_missing_empty_s3_object(
     )
     assert metadata.total_size == 0, f"Expected {logical_path} to be empty"
     assert not metadata.objects, f"Expected {logical_path} to have no S3 objects"
-    assert (
-        metadata.has_full_object_key()
-    ), f"Expected full S3 object keys in metadata version {metadata.version}"
 
-    reference_key = get_s3_object_keys_for_part_file(
+    reference_path = os.path.join(part_path, "id.bin")
+    reference_result = container.exec_run(["cat", reference_path])
+    assert reference_result.exit_code == 0, reference_result.output.decode(
+        errors="replace"
+    )
+    reference_metadata = S3ObjectLocalMetaData.from_string(
+        reference_result.output.decode(encoding="latin-1")
+    )
+    assert len(reference_metadata.objects) == 1, (
+        f"Expected one S3 object in {reference_path}, "
+        f"found {len(reference_metadata.objects)}"
+    )
+    assert (
+        reference_metadata.has_full_object_key() == metadata.has_full_object_key()
+    ), f"Expected matching object key formats in {logical_path} and {reference_path}"
+
+    reference_keys = get_s3_object_keys_for_part_file(
         context, node, part_path, "id.bin"
-    )[0]
-    missing_key = f"{reference_key}.missing-empty"
+    )
+    assert len(reference_keys) == 1, (
+        f"Expected one remote S3 object for {reference_path}, "
+        f"found {len(reference_keys)}"
+    )
+    reference_object = reference_metadata.objects[0]
+    reference_key = reference_keys[0]
+    assert reference_key.endswith(reference_object.key), (
+        f"Expected remote S3 key {reference_key} to end with metadata key "
+        f"{reference_object.key}"
+    )
+
+    missing_metadata_key = f"{reference_object.key}.missing-empty"
+    missing_s3_key = f"{reference_key}.missing-empty"
     s3_client = s3.S3Client(context)
-    assert not s3_client.path_exists(missing_key)
+    assert not s3_client.path_exists(missing_s3_key)
 
     replacement = (
         f"{metadata.version}\n"
         f"1\t0\n"
-        f"0\t{missing_key}\n"
+        f"0\t{missing_metadata_key}\n"
         f"{metadata.ref_counter}\n"
         f"{int(metadata.read_only)}\n\n"
     )
