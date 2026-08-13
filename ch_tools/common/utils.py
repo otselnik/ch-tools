@@ -19,6 +19,26 @@ def escape_for_file_name(value: str) -> str:
     return "".join(result)
 
 
+def unescape_for_file_name(value: str) -> str:
+    """Decode ClickHouse ``escapeForFileName`` sequences as UTF-8 bytes."""
+    result = bytearray()
+    index = 0
+    while index < len(value):
+        if value[index] == "%" and index + 2 < len(value):
+            encoded_byte = value[index + 1 : index + 3]
+            try:
+                result.append(int(encoded_byte, 16))
+            except ValueError:
+                pass
+            else:
+                index += 3
+                continue
+
+        result.extend(value[index].encode())
+        index += 1
+    return result.decode()
+
+
 def version_ge(version1: str, version2: str) -> bool:
     """
     Return True if version1 is greater or equal than version2.

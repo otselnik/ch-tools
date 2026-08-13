@@ -32,6 +32,7 @@ from ch_tools.chadmin.internal.object_storage.s3_object_metadata import (
     object_exists,
     restore_empty_object,
 )
+from ch_tools.common.utils import escape_for_file_name
 
 
 def test_columns_round_trip() -> None:
@@ -106,6 +107,20 @@ def test_columns_parsers_accept_clickhouse_backslash_escapes() -> None:
     metadata.validate_columns_substreams(columns, substreams)
 
 
+def test_columns_substreams_render_clickhouse_backquoted_escapes() -> None:
+    name = "tick`slash\\nul\0back\bform\fline\nreturn\rtab\t"
+    columns = [PartColumn(name, "String", "")]
+    substreams = {name: [escape_for_file_name(name)]}
+
+    rendered = metadata.render_columns_substreams(substreams, columns).decode()
+
+    expected_name = r"`tick\`slash\\nul\0back\bform\fline\nreturn\rtab\t`"
+    assert f"1 substreams for column {expected_name}:" in rendered
+    parsed = metadata.parse_columns_substreams(rendered)
+    assert list(parsed) == [name]
+    metadata.validate_columns_substreams(columns, parsed)
+
+
 def test_columns_substreams_reject_duplicate_columns() -> None:
     quote = chr(96)
     value = (
@@ -160,6 +175,77 @@ def test_compact_part_is_only_recoverable_as_a_whole() -> None:
     broken = recovery._analyze_compact(columns, files, 12, None, None)
     assert not broken.recovered_columns
     assert set(broken.lost_files_by_column) == {"a", "b"}
+
+
+@pytest.mark.parametrize(
+    "mark_file,expected_part_type",
+    [
+        ("value.mrk", "Wide"),
+        ("value.cmrk", "Wide"),
+        ("value.mrk2", "Wide"),
+        ("value.cmrk2", "Wide"),
+        ("data.mrk3", "Compact"),
+        ("data.cmrk3", "Compact"),
+        ("data.mrk4", "Compact"),
+        ("data.cmrk4", "Compact"),
+    ],
+)
+def test_detect_part_type_from_mark_version(
+    mark_file: str, expected_part_type: str
+) -> None:
+    assert recovery._detect_part_type({mark_file: True}) == expected_part_type
+
+
+@pytest.mark.parametrize(
+    "files,error",
+    [
+        ({"data.bin": True}, "no ClickHouse mark files"),
+        ({"data.mrk5": True}, "Unsupported ClickHouse mark file"),
+        (
+            {"value.mrk2": True, "data.mrk3": True},
+            "Conflicting ClickHouse mark versions",
+        ),
+    ],
+)
+def test_detect_part_type_rejects_ambiguous_layouts(
+    files: dict[str, bool], error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        recovery._detect_part_type(files)
+
+
+def test_wide_column_named_data_is_not_misclassified_as_compact() -> None:
+    source = RecoverySource(
+        SourceTable(TableRef("db", "source"), "s3", ["/source"]),
+        DiskInfo("s3", Path("/source")),
+        Path("/source/detached/part"),
+        "source/detached/part",
+        "part",
+    )
+    disk_client = MagicMock()
+    disk_client.read.side_effect = [
+        (
+            b"columns format version: 1\n"
+            b"2 columns:\n"
+            b"`data` UInt64\n"
+            b"`lost` String\n"
+        ),
+        b"3\n",
+    ]
+    files = {
+        recovery.COLUMNS_FILE: True,
+        COUNT_FILE: True,
+        "data.bin": True,
+        "data.mrk2": True,
+        "lost.bin": False,
+        "lost.mrk2": True,
+    }
+
+    analysis = recovery._analyze_part(MagicMock(), disk_client, source, files)
+
+    assert analysis.part_type == "Wide"
+    assert [column.name for column in analysis.recovered_columns] == ["data"]
+    assert analysis.lost_files_by_column == {"lost": ["lost.bin"]}
 
 
 def test_legacy_wide_part_uses_intact_column_streams() -> None:

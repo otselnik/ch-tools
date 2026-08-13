@@ -23,7 +23,7 @@ from ch_tools.chadmin.internal.utils import chunked, replace_macros
 from ch_tools.common import logging
 from ch_tools.common.clickhouse.config import get_clickhouse_config, get_macros
 from ch_tools.common.clickhouse.config.clickhouse import ClickhouseConfig
-from ch_tools.common.utils import escape_for_file_name
+from ch_tools.common.utils import escape_for_file_name, unescape_for_file_name
 
 
 class ZKTransactionBuilder:
@@ -410,23 +410,7 @@ def unescape_from_zookeeper(s: str) -> str:
 
     Example: "table%2Dname" -> "table-name"
     """
-    result = []
-    i = 0
-    while i < len(s):
-        if s[i] == "%" and i + 2 < len(s):
-            try:
-                hex_code = s[i + 1 : i + 3]
-                char_code = int(hex_code, 16)
-                result.append(chr(char_code))
-                i += 3
-            except (ValueError, OverflowError):
-                result.append(s[i])
-                i += 1
-        else:
-            result.append(s[i])
-            i += 1
-
-    return "".join(result)
+    return unescape_for_file_name(s)
 
 
 def get_table_shared_id(ctx: Context, zk_path: str) -> str:

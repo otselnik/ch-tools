@@ -1,6 +1,29 @@
 import pytest
 
-from ch_tools.common.utils import version_ge, version_lt
+from ch_tools.common.utils import (
+    escape_for_file_name,
+    unescape_for_file_name,
+    version_ge,
+    version_lt,
+)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "plain_name",
+        "table-name.with spaces",
+        "таблица",
+        "日本語/данные",
+    ],
+)
+def test_file_name_escape_round_trip(value: str) -> None:
+    assert unescape_for_file_name(escape_for_file_name(value)) == value
+
+
+@pytest.mark.parametrize("value", ["%", "%1", "%GG", "value%GGsuffix"])
+def test_file_name_unescape_preserves_malformed_sequences(value: str) -> None:
+    assert unescape_for_file_name(value) == value
 
 
 @pytest.mark.parametrize(

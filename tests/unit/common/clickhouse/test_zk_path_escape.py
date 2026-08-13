@@ -1,6 +1,9 @@
 import pytest
 
-from ch_tools.chadmin.internal.zookeeper import escape_for_zookeeper
+from ch_tools.chadmin.internal.zookeeper import (
+    escape_for_zookeeper,
+    unescape_from_zookeeper,
+)
 
 # type: ignore
 
@@ -16,5 +19,5 @@ from ch_tools.chadmin.internal.zookeeper import escape_for_zookeeper
     ],
 )
 def test_config(hostname: str, result: str) -> None:
-
     assert escape_for_zookeeper(hostname) == result
+    assert unescape_from_zookeeper(result) == hostname

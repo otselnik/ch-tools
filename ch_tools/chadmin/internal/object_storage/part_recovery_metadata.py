@@ -129,6 +129,21 @@ def _parse_backquoted(value: str) -> Tuple[str, int]:
     raise ValueError(f"Unterminated backquoted value: {value}")
 
 
+def _quote_backquoted(value: str) -> str:
+    """Render a ClickHouse backquoted identifier with its standard escapes."""
+    escapes = {
+        "\0": "\\0",
+        "\b": "\\b",
+        "\f": "\\f",
+        "\n": "\\n",
+        "\r": "\\r",
+        "\t": "\\t",
+        "\\": "\\\\",
+        "`": "\\`",
+    }
+    return "`" + "".join(escapes.get(char, char) for char in value) + "`"
+
+
 def _parse_column_definition(definition: str) -> Tuple[str, str]:
     """Split a ``columns.txt`` definition into its name and type."""
     name, end = _parse_backquoted(definition)
@@ -238,8 +253,8 @@ def render_columns_substreams(
         column_streams = substreams.get(column.name)
         if not column_streams:
             raise ValueError(f"No substreams found for column {column.name}")
-        escaped_name = column.name.replace("`", "``")
-        lines.append(f"{len(column_streams)} substreams for column `{escaped_name}`:")
+        quoted_name = _quote_backquoted(column.name)
+        lines.append(f"{len(column_streams)} substreams for column {quoted_name}:")
         lines.extend(f"\t{stream}" for stream in column_streams)
     return ("\n".join(lines) + "\n").encode()
 

@@ -18,7 +18,7 @@ Feature: Recover data from broken detached object-storage parts
     CREATE TABLE recovery_source.source
     (
         id UInt64,
-        keep String,
+        data String,
         lost String
     )
     ENGINE = MergeTree
@@ -65,12 +65,12 @@ Feature: Recover data from broken detached object-storage parts
     Then we get response
     """
     id
-    keep
+    data
     """
 
     When we execute query on clickhouse01
     """
-    SELECT id, keep
+    SELECT id, data
     FROM recovered_by_path.data
     ORDER BY id
     """
@@ -93,7 +93,7 @@ Feature: Recover data from broken detached object-storage parts
 
     When we execute query on clickhouse01
     """
-    SELECT id, keep
+    SELECT id, data
     FROM recovered_by_name.data
     ORDER BY id
     """
@@ -123,7 +123,7 @@ Feature: Recover data from broken detached object-storage parts
 
     When we execute query on clickhouse01
     """
-    SELECT id, keep
+    SELECT id, data
     FROM recovered_by_table.data
     ORDER BY id
     """
@@ -178,7 +178,7 @@ Feature: Recover data from broken detached object-storage parts
 
     When we execute query on clickhouse01
     """
-    SELECT id, keep
+    SELECT id, data
     FROM recovery_source.source_recovered_broken_part
     ORDER BY id
     """

@@ -64,7 +64,10 @@ STAGING_PART_NAME = "all_0_0_0"
 
 # Compatibility and part-layout constraints.
 MIN_CLICKHOUSE_VERSION = "25.8"
-MARK_SUFFIX_RE = re.compile(r"\.(?:c?mrk\d*)$")
+MARK_SUFFIX_RE = re.compile(r"\.(?:c?mrk(?:[234])?)$")
+MARK_FILE_RE = re.compile(r"\.(?:c?mrk)(?P<version>[^.]*)$")
+WIDE_MARK_VERSIONS = {"", "2"}
+COMPACT_MARK_VERSIONS = {"3", "4"}
 
 
 @dataclass(frozen=True)
@@ -231,12 +234,9 @@ def _analyze_part(
             _read_source_file(disk_client, source, SERIALIZATION_FILE)
         )
 
-    # Compact parts share one data stream; Wide parts can recover columns
-    # independently when all streams belonging to a column are intact.
-    if "data.bin" in file_recoverability and any(
-        name.startswith("data.mrk") or name.startswith("data.cmrk")
-        for name in file_recoverability
-    ):
+    # Mark-file versions encode the part layout. A Wide column named ``data``
+    # also owns data.bin/data.mrk*, so filenames alone are not sufficient.
+    if _detect_part_type(file_recoverability) == "Compact":
         analysis = _analyze_compact(
             columns, file_recoverability, rows, substreams, serialization
         )
@@ -251,6 +251,34 @@ def _analyze_part(
         if not analysis.has_row_exists:
             raise ValueError("The lightweight-delete mask is not fully recoverable")
     return analysis
+
+
+def _detect_part_type(file_recoverability: Dict[str, bool]) -> str:
+    """Determine the MergeTree part layout from ClickHouse mark versions."""
+    part_types: Set[str] = set()
+    unsupported: List[str] = []
+    for filename in file_recoverability:
+        match = MARK_FILE_RE.search(filename)
+        if match is None:
+            continue
+        version = match.group("version")
+        if version in WIDE_MARK_VERSIONS:
+            part_types.add("Wide")
+        elif version in COMPACT_MARK_VERSIONS:
+            part_types.add("Compact")
+        else:
+            unsupported.append(filename)
+
+    if unsupported:
+        raise ValueError(
+            "Unsupported ClickHouse mark file extensions: "
+            + ", ".join(sorted(unsupported))
+        )
+    if not part_types:
+        raise ValueError("Cannot determine part type: no ClickHouse mark files found")
+    if len(part_types) != 1:
+        raise ValueError("Conflicting ClickHouse mark versions in detached part")
+    return next(iter(part_types))
 
 
 def _require_recoverable_file(
