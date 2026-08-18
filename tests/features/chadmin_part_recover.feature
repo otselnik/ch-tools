@@ -393,6 +393,113 @@ Feature: Recover data from broken detached object-storage parts
     2\ttwo
     """
 
+  @require_version_25.8
+  Scenario: Recover a Wide part with Nested columns
+    When we execute queries on clickhouse01
+    """
+    DROP DATABASE IF EXISTS nested_recovery_source;
+    DROP DATABASE IF EXISTS recovered_nested;
+
+    CREATE DATABASE nested_recovery_source;
+    CREATE TABLE nested_recovery_source.source
+    (
+        id UInt64,
+        items Nested(name String, value UInt64),
+        lost String
+    )
+    ENGINE = MergeTree
+    ORDER BY tuple()
+    SETTINGS
+        storage_policy = 'object_storage',
+        min_bytes_for_wide_part = 0,
+        min_rows_for_wide_part = 0;
+
+    INSERT INTO nested_recovery_source.source VALUES
+        (1, ['one', 'two'], [10, 20], 'lost-one'),
+        (2, ['three'], [30], 'lost-two');
+
+    ALTER TABLE nested_recovery_source.source DETACH PARTITION tuple();
+    """
+    And we remove S3 blobs for file lost.bin from detached part nested_recovery_source.source on clickhouse01
+
+    When we execute command on clickhouse01
+    """
+    PART_NAME=$(clickhouse client --query "
+        SELECT name FROM system.detached_parts
+        WHERE database = 'nested_recovery_source' AND table = 'source'
+    ")
+    chadmin part recover --database nested_recovery_source --table source --name "$PART_NAME" --target-table recovered_nested.data
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT
+        id,
+        arrayStringConcat(items.name, ','),
+        arrayStringConcat(arrayMap(item -> toString(item), items.value), ',')
+    FROM recovered_nested.data
+    ORDER BY id
+    """
+    Then we get query response
+    """
+    1\tone,two\t10,20
+    2\tthree\t30
+    """
+
+  @require_version_25.8
+  Scenario: Recover a Wide part with a lightweight-delete mask
+    When we execute queries on clickhouse01
+    """
+    DROP DATABASE IF EXISTS lightweight_delete_source;
+    DROP DATABASE IF EXISTS recovered_lightweight_delete;
+
+    CREATE DATABASE lightweight_delete_source;
+    CREATE TABLE lightweight_delete_source.source
+    (
+        id UInt64,
+        value String,
+        lost String
+    )
+    ENGINE = MergeTree
+    ORDER BY tuple()
+    SETTINGS
+        storage_policy = 'object_storage',
+        min_bytes_for_wide_part = 0,
+        min_rows_for_wide_part = 0;
+
+    INSERT INTO lightweight_delete_source.source VALUES
+        (1, 'one', 'lost-one'),
+        (2, 'two', 'lost-two'),
+        (3, 'three', 'lost-three');
+
+    SET lightweight_deletes_sync = 1;
+    DELETE FROM lightweight_delete_source.source WHERE id = 2;
+    ALTER TABLE lightweight_delete_source.source DETACH PARTITION tuple();
+    """
+    And we remove S3 blobs for file lost.bin from detached part lightweight_delete_source.source on clickhouse01
+
+    When we execute command on clickhouse01
+    """
+    PART_NAME=$(clickhouse client --query "
+        SELECT name FROM system.detached_parts
+        WHERE database = 'lightweight_delete_source' AND table = 'source'
+    ")
+    chadmin part recover --database lightweight_delete_source --table source --name "$PART_NAME" --target-table recovered_lightweight_delete.data
+    """
+
+    When we execute query on clickhouse01
+    """
+    SELECT id, value, _recovery_row_exists
+    FROM recovered_lightweight_delete.data
+    ORDER BY id
+    """
+    Then we get query response
+    """
+    1\tone\t1
+    2\ttwo\t0
+    3\tthree\t1
+    """
+
   @require_version_less_than_25.8
   Scenario: Reject part recovery on an unsupported ClickHouse version
     When we try to execute command on clickhouse01

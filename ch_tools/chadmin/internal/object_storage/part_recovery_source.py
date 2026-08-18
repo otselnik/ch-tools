@@ -110,27 +110,28 @@ def resolve_recovery_source(
         raise ValueError("--database and --table must be specified together")
     if part_name and not database:
         raise ValueError("--name requires --database and --table")
+    if part_path is not None and not Path(part_path).is_absolute():
+        raise ValueError("--path must be absolute")
 
     tables = _list_merge_tree_tables(ctx)
-    explicit_ref = TableRef(database, table) if database and table else None
+    source_ref = TableRef(database, table) if database and table else None
 
     if part_name:
-        assert explicit_ref is not None
-        detached = _find_detached_part(ctx, explicit_ref, part_name)
+        assert source_ref is not None
+        detached = _find_detached_part(ctx, source_ref, part_name)
         path = Path(detached["path"]).resolve()
-        inferred_ref: Optional[TableRef] = explicit_ref
         display_part_name = detached["name"]
     else:
         assert part_path is not None
         path = Path(part_path).resolve()
         inferred_ref = _infer_table_from_path(ctx, path, tables)
         display_part_name = path.name
+        if source_ref and inferred_ref and source_ref != inferred_ref:
+            raise ValueError(
+                f"Path belongs to {inferred_ref.display}, not {source_ref.display}"
+            )
+        source_ref = source_ref or inferred_ref
 
-    if explicit_ref and inferred_ref and explicit_ref != inferred_ref:
-        raise ValueError(
-            f"Path belongs to {inferred_ref.display}, not {explicit_ref.display}"
-        )
-    source_ref = explicit_ref or inferred_ref
     if source_ref is None:
         raise ValueError(
             "Cannot infer source table from --path; specify --database and --table"

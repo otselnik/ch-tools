@@ -479,6 +479,80 @@ def test_path_infers_table_from_detached_data_path(
     ) == TableRef("db", "source")
 
 
+def test_relative_part_path_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_tables = MagicMock()
+    monkeypatch.setattr(recovery_source, "_list_merge_tree_tables", list_tables)
+
+    with pytest.raises(ValueError, match="--path must be absolute"):
+        recovery_source.resolve_recovery_source(
+            MagicMock(), None, None, None, "relative/part"
+        )
+
+    list_tables.assert_not_called()
+
+
+def test_explicit_table_must_match_path_inference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    part_path = tmp_path / "broken_all_1_1_0"
+    part_path.mkdir()
+    infer_table = MagicMock(return_value=TableRef("db", "inferred"))
+    monkeypatch.setattr(
+        recovery_source, "_list_merge_tree_tables", MagicMock(return_value=[])
+    )
+    monkeypatch.setattr(recovery_source, "_infer_table_from_path", infer_table)
+
+    with pytest.raises(ValueError, match="Path belongs to db.inferred, not db.source"):
+        recovery_source.resolve_recovery_source(
+            MagicMock(), "db", "source", None, str(part_path)
+        )
+
+
+def test_part_name_uses_explicit_source_without_path_inference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    part_path = tmp_path / "detached" / "broken_all_1_1_0"
+    part_path.mkdir(parents=True)
+    source_table = SourceTable(TableRef("db", "source"), "s3", [str(tmp_path)])
+    infer_table = MagicMock()
+    validate_policy = MagicMock()
+    monkeypatch.setattr(
+        recovery_source,
+        "_list_merge_tree_tables",
+        MagicMock(return_value=[source_table]),
+    )
+    monkeypatch.setattr(
+        recovery_source,
+        "_find_detached_part",
+        MagicMock(
+            return_value={
+                "name": part_path.name,
+                "path": str(part_path),
+            }
+        ),
+    )
+    monkeypatch.setattr(recovery_source, "_infer_table_from_path", infer_table)
+    monkeypatch.setattr(
+        recovery_source,
+        "_find_disk_for_path",
+        MagicMock(return_value=DiskInfo("s3", tmp_path)),
+    )
+    monkeypatch.setattr(recovery_source, "_validate_policy_disk", validate_policy)
+
+    source = recovery_source.resolve_recovery_source(
+        MagicMock(), "db", "source", part_path.name, None
+    )
+
+    assert source.table == source_table
+    assert source.relative_path == f"detached/{part_path.name}"
+    infer_table.assert_not_called()
+    validate_policy.assert_called_once()
+
+
 @patch(
     "ch_tools.chadmin.internal.object_storage.part_recovery_source._validate_policy_disk"
 )
