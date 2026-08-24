@@ -9,6 +9,7 @@ from ch_tools.common import logging
 from ch_tools.common.clickhouse.config import ClickhouseConfig
 from ch_tools.common.utils import version_ge
 
+CLICKHOUSE_DISKS_TIMEOUT = 15 * 60
 CLICKHOUSE_PATH = "/var/lib/clickhouse"
 CLICKHOUSE_STORE_PATH = CLICKHOUSE_PATH + "/store"
 CLICKHOUSE_DATA_PATH = CLICKHOUSE_PATH + "/data"
@@ -71,13 +72,20 @@ class ClickHouseDiskClient:
         if dry_run:
             return subprocess.CompletedProcess(args, 0, b"", b"")
 
-        proc = subprocess.run(
-            args,
-            input=stdin,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            proc = subprocess.run(
+                args,
+                input=stdin,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=CLICKHOUSE_DISKS_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                "clickhouse-disks command timed out after "
+                f"{CLICKHOUSE_DISKS_TIMEOUT} seconds: {args}"
+            ) from e
         if proc.returncode == 0 and _query_has_error(proc.stderr):
             proc = subprocess.CompletedProcess(
                 proc.args,

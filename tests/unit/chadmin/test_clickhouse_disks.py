@@ -3,7 +3,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ch_tools.chadmin.internal.clickhouse_disks import ClickHouseDiskClient
+from ch_tools.chadmin.internal.clickhouse_disks import (
+    CLICKHOUSE_DISKS_TIMEOUT,
+    ClickHouseDiskClient,
+)
 
 
 @patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
@@ -29,6 +32,25 @@ def test_clickhouse_disks_uses_argument_list_without_shell(
     assert arguments[-2:] == ["--query", "read 'path with spaces/file.bin'"]
     assert run.call_args.kwargs["check"] is False
     assert "shell" not in run.call_args.kwargs
+    assert run.call_args.kwargs["timeout"] == CLICKHOUSE_DISKS_TIMEOUT
+
+
+@patch("ch_tools.chadmin.internal.clickhouse_disks.logging")
+@patch("ch_tools.chadmin.internal.clickhouse_disks.subprocess.run")
+def test_clickhouse_disks_reports_timeout(
+    run: MagicMock,
+    _logging: MagicMock,
+) -> None:
+    run.side_effect = subprocess.TimeoutExpired(
+        ["clickhouse-disks"], CLICKHOUSE_DISKS_TIMEOUT
+    )
+    client = ClickHouseDiskClient("s3", "/tmp/disks.xml")
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"timed out after {CLICKHOUSE_DISKS_TIMEOUT} seconds",
+    ):
+        client.read("file.bin")
 
 
 @pytest.mark.parametrize(
