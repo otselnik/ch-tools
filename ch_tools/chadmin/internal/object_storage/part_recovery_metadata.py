@@ -100,13 +100,13 @@ def _parse_backquoted(value: str) -> Tuple[str, int]:
     index = 1
     escapes = {
         "0": "\0",
-        "a": "\a",
         "b": "\b",
         "f": "\f",
         "n": "\n",
         "r": "\r",
         "t": "\t",
-        "v": "\v",
+        "\\": "\\",
+        "`": "`",
     }
     while index < len(value):
         char = value[index]
@@ -120,7 +120,11 @@ def _parse_backquoted(value: str) -> Tuple[str, int]:
             if index + 1 >= len(value):
                 raise ValueError(f"Invalid escape in backquoted value: {value}")
             escaped = value[index + 1]
-            result.append(escapes.get(escaped, escaped))
+            if escaped not in escapes:
+                raise ValueError(
+                    f"Unsupported escape in backquoted identifier: \\{escaped}"
+                )
+            result.append(escapes[escaped])
             index += 2
             continue
         result.append(char)

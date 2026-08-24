@@ -107,6 +107,22 @@ def test_columns_parsers_accept_clickhouse_backslash_escapes() -> None:
     metadata.validate_columns_substreams(columns, substreams)
 
 
+@pytest.mark.parametrize("escape", [r"\x2E", r"\N", r"\a", r"\v", r"\q"])
+def test_columns_parsers_reject_noncanonical_backslash_escapes(escape: str) -> None:
+    columns = "columns format version: 1\n" "1 columns:\n" f"`a{escape}b` String\n"
+    substreams = (
+        "columns substreams version: 1\n"
+        "1 columns:\n"
+        f"1 substreams for column `a{escape}b`:\n"
+        "\ta\n"
+    )
+
+    with pytest.raises(ValueError, match="Unsupported escape in backquoted identifier"):
+        metadata.parse_columns_text(columns)
+    with pytest.raises(ValueError, match="Unsupported escape in backquoted identifier"):
+        metadata.parse_columns_substreams(substreams)
+
+
 def test_columns_substreams_render_clickhouse_backquoted_escapes() -> None:
     name = "tick`slash\\nul\0back\bform\fline\nreturn\rtab\t"
     columns = [PartColumn(name, "String", "")]
