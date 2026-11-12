@@ -1,0 +1,88 @@
+name: Verify ch-tools parallel integration
+on:
+  push:
+    branches: [bd_dev/parallel-integration-check-521]
+permissions:
+  contents: read
+env:
+  TEST_SHA: bc31ca709e2b6d438228983f5dd19badd640f7b6
+jobs:
+  timings:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        clickhouse: ['23.3.22.3', latest]
+        slots: [1, 3]
+    env:
+      CLICKHOUSE_VERSION: ${{ matrix.clickhouse }}
+      INTEGRATION_JOBS: ${{ matrix.slots }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TEST_SHA }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.10'
+      - uses: ./.github/actions/test-integration
+        with:
+          artifact-suffix: bench-${{ matrix.clickhouse }}-slots-${{ matrix.slots }}
+  isolation:
+    runs-on: ubuntu-latest
+    env:
+      CLICKHOUSE_VERSION: latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TEST_SHA }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.10'
+      - run: make build-python-packages
+      - name: Cancel one of two overlapping coordinators
+        shell: python
+        run: |
+          import json, os, signal, subprocess, time
+          from pathlib import Path
+          python = str(Path('.venv/bin/python').absolute())
+          def start(jobs, features):
+              return subprocess.Popen([python, 'tests/parallel.py', '--jobs', str(jobs)], env={**os.environ, 'BEHAVE_ARGS': f'-i "{features}"'})
+          def active(jobs, process, count):
+              deadline = time.monotonic() + 2400
+              while time.monotonic() < deadline:
+                  for path in Path('tests/staging/parallel').glob('*/results/summary.json'):
+                      s = json.loads(path.read_text())
+                      if s['jobs'] == jobs and sum(f['status'] == 'running' for f in s['features'].values()) >= count:
+                          return path
+                  assert process.poll() is None, f'early exit: {process.returncode}'
+                  time.sleep(2)
+              raise TimeoutError('workers did not start')
+          keep = start(2, 'chadmin_replica|chadmin_zero_copy')
+          keep_summary = active(2, keep, 2)
+          cancel = start(1, 'database_migrate')
+          cancel_summary = active(1, cancel, 1)
+          # Wait until a container is actually present in the run being cancelled.
+          env_id = json.loads(cancel_summary.read_text())['workers']['worker-1']['environment']
+          label = f'label=ch-tools.integration.environment={env_id}'
+          for _ in range(90):
+              if subprocess.check_output(['docker','ps','-q','--filter',label]).strip():
+                  break
+              time.sleep(1)
+          else:
+              raise RuntimeError('no container for cancellation check')
+          assert keep.poll() is None, 'no overlap between checks'
+          cancel.send_signal(signal.SIGTERM)
+          assert cancel.wait(timeout=180) == 143
+          assert json.loads(cancel_summary.read_text())['status'] == 'cancelled'
+          assert not subprocess.check_output(['docker','ps','-aq','--filter',label]).strip()
+          assert not subprocess.check_output(['docker','network','ls','-q','--filter',label]).strip()
+          assert keep.wait(timeout=7200) == 0
+          assert all(f['status'] == 'passed' for f in json.loads(keep_summary.read_text())['features'].values())
+          assert len({p.parent.name for p in keep_summary.parent.glob('features/**/saved-logs/*/*.log')}) > 2
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: isolation-results
+          path: tests/staging/parallel/*/results
