@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 env:
-  TEST_SHA: 26937a7c324be21b64ca33911ccef7634552cff7
+  TEST_SHA: 8a3e3ac4c1324178767e09d400db1ca41861df68
 jobs:
   timings:
     runs-on: ubuntu-latest
@@ -86,3 +86,25 @@ jobs:
         with:
           name: isolation-results
           path: tests/staging/parallel/*/results
+
+  serial-smoke:
+    runs-on: ubuntu-latest
+    env:
+      CLICKHOUSE_VERSION: '23.3.22.3'
+      BEHAVE_ARGS: -i chadmin_replica -n "Check drop replica"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TEST_SHA }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.10'
+      - run: make test-integration
+      - run: |
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          cases = [case for path in Path('tests/reports').glob('*.xml') for case in ET.parse(path).iter('testcase')]
+          assert sum(case.get('status') == 'passed' for case in cases) == 1
+          PYTEST
