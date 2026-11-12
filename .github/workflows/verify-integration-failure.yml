@@ -1,0 +1,70 @@
+name: Check integration failure diagnostics
+on:
+  push:
+    branches: [bd_dev/parallel-failure-check-521]
+permissions:
+  contents: read
+jobs:
+  failed-feature:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cause: [step, hook]
+    env:
+      CLICKHOUSE_VERSION: '23.3.22.3'
+      INTEGRATION_JOBS: '1'
+      BEHAVE_ARGS: -i ci_failure
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: 3cde4399b141da12be96fc310a7dc385fd12b10e
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: '3.12'
+      - name: Add an intentional failure to the throwaway checkout
+        shell: bash
+        env:
+          CAUSE: ${{ matrix.cause }}
+        run: |
+          cat > tests/features/ci_failure.feature <<'EOF'
+          Feature: CI diagnostics
+            Scenario: Deliberate assertion
+              When we execute command on clickhouse01
+                """
+                chadmin --help
+                """
+              Then it fails
+          EOF
+          if [ "$CAUSE" = hook ]; then
+            cat >> tests/environment.py <<'EOF'
+
+          prepare_scenario = before_scenario
+
+          def before_scenario(context, scenario):
+              prepare_scenario(context, scenario)
+              raise RuntimeError("deliberate hook failure")
+          EOF
+          fi
+      - id: integration
+        continue-on-error: true
+        uses: ./.github/actions/test-integration
+        with:
+          artifact-suffix: deliberate-${{ matrix.cause }}
+      - name: Validate failure and retained container diagnostics
+        shell: python
+        env:
+          OUTCOME: ${{ steps.integration.outcome }}
+        run: |
+          import json, os
+          from pathlib import Path
+          assert os.environ['OUTCOME'] == 'failure'
+          path, = Path('tests/staging/parallel').glob('*/results/summary.json')
+          report = json.loads(path.read_text())
+          assert report['status'] == 'failed'
+          feature, = report['features'].values()
+          assert feature['status'] == 'failed'
+          directory, = path.parent.glob('features/**/ci_failure')
+          for pattern in ['junit/*.xml','behave.log','logs/session_conf.json','logs/*/state.json','logs/*/docker.log','logs/minio/export','saved-logs/*/*.log']:
+              assert list(directory.glob(pattern)), pattern
