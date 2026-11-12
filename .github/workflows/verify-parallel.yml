@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 env:
-  TEST_SHA: b04f6c99e473027bfcba674db9474aac4327a4fc
+  TEST_SHA: 26937a7c324be21b64ca33911ccef7634552cff7
 jobs:
   timings:
     runs-on: ubuntu-latest
