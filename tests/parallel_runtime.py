@@ -1,5 +1,6 @@
 """Workspace snapshots, owned-resource cleanup and parallel test reports."""
 
+import fcntl
 import json
 import re
 import shutil
@@ -149,6 +150,15 @@ def finish_cancelled_run(run_id: str) -> None:
     summary = directory / "results/summary.json"
     if not summary.exists():
         return
+    # A cancelled Actions shell can leave its coordinator running. Ask it to
+    # stop its process groups and wait before touching their Docker resources.
+    (directory / "cancel-requested").touch()
+    with (directory / "coordinator.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _finish_cancelled_summary(directory, summary, run_id)
+
+
+def _finish_cancelled_summary(directory: Path, summary: Path, run_id: str) -> None:
     report = json.loads(summary.read_text())
     if report["run_id"] != run_id:
         raise ValueError("Integration run ID mismatch")
@@ -201,6 +211,9 @@ def read_outcome(destination: Path, returncode: int, expected: int) -> dict:
         ]
         if problems:
             message = problems[0].get("message") or problems[0].get("type") or ""
+            # Behave 1.2.6 puts an undefined step in the XML body with message="None".
+            if message in ("", "None"):
+                message = problems[0].text or message
             outcome["message"] = " ".join(message.split())[:300]
         complete = all(status in ("passed", "skipped") for status in statuses)
         junit_failed = bool(problems)
